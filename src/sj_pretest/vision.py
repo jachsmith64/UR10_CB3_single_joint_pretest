@@ -68,9 +68,27 @@ class FrameVision:
     #: 相对参考帧的整体平移（像素），直接由质心差算，不经过被复用代码的 dx/dy。
     shift_x_px: float | None
     shift_y_px: float | None
+    #: ★ 相对本段参考帧的**相似变换尺度**（1.0 = 和参考帧一样大）。
+    #: 它由 Kabsch 顺带算出（最小二乘最优缩放），是棋盘格在画面里"变大/变小"的
+    #: 直接度量，也就是相机与板之间**轴向**距离变化的一阶观测量：
+    #:     深度变化 ≈ 工作距离 × |scale − 1|
+    #: 以前这个量算出来就被丢掉了（``_scale``），轴向运动因此完全没被检查。
+    scale: float | None
     #: 图像质量指标（来自 preprocess_frame）。
     mean_brightness: float | None
     blur_variance: float | None
+    #: ★ 本帧 88 个内角点到自身质心的**均方根半径**（像素）。
+    #:
+    #: 这是 J6 面内位移公式里的 ``r_rms``。J6 绕自身轴转，棋盘格**不保证**
+    #: 装在旋转轴中心（现场可能偏心 5～15 mm），所以面内运动量不能只看质心平移：
+    #: 质心平移只反映"偏心量 × 转角"，板自己转了多少一点没进去。
+    #: 绕轴转 θ 时，距轴 r 的一点在画面里扫过的弧长是 2·r·sin(|θ|/2)；
+    #: 板有大小，取"转动惯量"意义下的等效半径（均方根半径）：
+    #:     r_rms = √( mean_i |p_i − 质心|² )
+    #: 参考帧的角点在本段内是常量，所以这个值每帧一样；存下来是为了
+    #: RAW 删掉之后仍能从 JSON 复算面内位移，不依赖角点 CSV 是否还在。
+    #: （带默认值，所以放在所有无默认值字段的后面。）
+    r_rms_px: float | None = None
     drop_before: int = 0
     #: 这一帧的角点坐标，写 CSV 用；不写时留 None 以省内存。
     points_px: np.ndarray | None = None
@@ -89,12 +107,61 @@ class FrameVision:
             "shift_y_px": _fmt(self.shift_y_px, 4),
             "rotation_deg": _fmt(self.rotation_deg, 5),
             "residual_px": _fmt(self.residual_px, 4),
+            "scale": _fmt(self.scale, 7),
+            "r_rms_px": _fmt(self.r_rms_px, 4),
             "quality": _fmt(self.quality, 4),
             "mm_per_pixel": _fmt(self.mm_per_pixel, 6),
             "mean_brightness": _fmt(self.mean_brightness, 3),
             "blur_variance": _fmt(self.blur_variance, 3),
             "drop_before": int(self.drop_before),
         }
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """不带角点的存盘形式（角点单独存 CSV，见 :func:`save_vision_json`）。"""
+        return {
+            "frame_id": int(self.frame_id),
+            "host_ns": int(self.host_ns),
+            "analysis_time_s": float(self.analysis_time_s),
+            "valid": bool(self.valid),
+            "corner_count": int(self.corner_count),
+            "centroid_x_px": self.centroid_x_px,
+            "centroid_y_px": self.centroid_y_px,
+            "shift_x_px": self.shift_x_px,
+            "shift_y_px": self.shift_y_px,
+            "rotation_deg": self.rotation_deg,
+            "residual_px": self.residual_px,
+            "scale": self.scale,
+            "r_rms_px": self.r_rms_px,
+            "quality": self.quality,
+            "mm_per_pixel": self.mm_per_pixel,
+            "mean_brightness": self.mean_brightness,
+            "blur_variance": self.blur_variance,
+            "drop_before": int(self.drop_before),
+        }
+
+    @classmethod
+    def from_json_dict(cls, payload: dict[str, Any]) -> "FrameVision":
+        frame = cls(
+            frame_id=int(payload["frame_id"]),
+            host_ns=int(payload["host_ns"]),
+            analysis_time_s=float(payload["analysis_time_s"]),
+            valid=bool(payload["valid"]),
+            corner_count=int(payload["corner_count"]),
+            centroid_x_px=payload.get("centroid_x_px"),
+            centroid_y_px=payload.get("centroid_y_px"),
+            rotation_deg=payload.get("rotation_deg"),
+            residual_px=payload.get("residual_px"),
+            scale=payload.get("scale"),
+            r_rms_px=payload.get("r_rms_px"),
+            quality=payload.get("quality"),
+            mm_per_pixel=payload.get("mm_per_pixel"),
+            shift_x_px=payload.get("shift_x_px"),
+            shift_y_px=payload.get("shift_y_px"),
+            mean_brightness=payload.get("mean_brightness"),
+            blur_variance=payload.get("blur_variance"),
+            drop_before=int(payload.get("drop_before", 0) or 0),
+        )
+        return frame
 
 
 @dataclass
@@ -156,6 +223,36 @@ class SegmentVision:
             if start_s <= frame.analysis_time_s <= end_s and frame.valid
         ]
 
+    def subsampled(self, step: int) -> "SegmentVision":
+        """按 ``step`` 抽帧，返回**新的一份**（不动自己）。
+
+        ★ 这是"RAW 已经删了，但下游要求按 step 抽帧看"的唯一正路。
+
+        ``process_segment(..., stride=step)`` 保留的是原始采集里下标
+        ``0, step, 2·step, …`` 的帧（见那里的 ``index % step``），参考帧是第一帧——
+        所以对一份 stride=1 的**完整**逐帧结果做同样的抽取，得到的帧集合、
+        参考帧、每一帧的转角/尺度/位移都和"直接对 RAW 抽帧跑一遍"逐位相同。
+        这条性质是必需的：边采边清之后 RAW 没了，任何"RAW 在"与"RAW 不在"
+        两条路径给出的结论必须一致，否则就等于拿数据换了磁盘。
+
+        抽帧只允许用在**已经完整算过一遍**的数据上（含内存里刚算的那一份）；
+        它不会、也不能凭空补出没算过的帧。
+        """
+        count = max(1, int(step))
+        if count == 1:
+            return self
+        picked = list(self.frames[::count])
+        return SegmentVision(
+            segment_id=self.segment_id,
+            segment_dir=self.segment_dir,
+            frames=picked,
+            reference_frame_id=self.reference_frame_id,
+            mm_per_pixel=self.mm_per_pixel,
+            phases=list(self.phases),
+            seconds=self.seconds,
+            synthetic=self.synthetic,
+        )
+
 
 def _fmt(value: float | None, digits: int) -> str:
     if value is None:
@@ -202,6 +299,55 @@ def kabsch_rotation_about_centroid(
     return angle_deg, residual, scale
 
 
+def rms_radius_px(points: np.ndarray) -> float:
+    """一组点到它们自身质心的均方根半径（像素）。
+
+    ``√( mean_i |p_i − 质心|² )``。用均方根半径而不是最大半径或平均半径：
+    它正是"绕质心转动"在均方意义下的等效半径——转动惯量意义下，板有大小这件事
+    只能用一个等效半径表达，而均方根半径给出的就是转动量的均方根。
+    """
+    array = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(array) == 0:
+        return 0.0
+    centered = array - array.mean(axis=0)
+    return float(np.sqrt(np.mean(np.sum(centered**2, axis=1))))
+
+
+def rotation_in_plane_px(rotation_deg: float | None, r_rms_px: float | None) -> float:
+    """J6 转动在画面里扫出的等效面内位移（像素）。
+
+    ``d_rot = 2 · r_rms · sin(|θ|/2)``
+
+    这是"板上离轴最远的那些点在均方意义下扫过多远"：绕轴转 θ 的点，其弦长是
+    ``2·r·sin(θ/2)``。取弦长而不是弧长，是因为画面里量到的就是**首末位置的位移**，
+    不是轨迹长度。
+
+    为什么不能只看质心平移：J6 绕自身轴转，棋盘格如果恰好装在轴中心，
+    质心**一点都不动**（平移是 0，而画面明明在转）；偏心 5～15 mm 时质心才动一点，
+    而且动多少取决于偏心量——那是安装公差，不是运动量。所以转动量必须单独算，
+    再和质心平移**合成**，见 :func:`in_plane_px_of_frame`。
+    """
+    if rotation_deg is None or r_rms_px is None:
+        return 0.0
+    half_rad = math.radians(abs(float(rotation_deg))) / 2.0
+    return float(2.0 * float(r_rms_px) * math.sin(half_rad))
+
+
+def in_plane_px_of_frame(frame: FrameVision, *, rotation_joint: bool) -> float:
+    """一帧相对参考帧的**面内位移**（像素）。
+
+    * J1～J5：就是质心二维位移的模。
+    * J6：把质心平移和**转动扫过的位移**合成——
+      ``d_plane = √(质心位移² + d_rot²)``。两项都算进去之后，
+      棋盘格居中（质心位移 0）和偏心 15 mm（质心位移不为 0）两种装法
+      都会被算成同一个量级的面内运动，判据不再跟着安装公差跑。
+    """
+    shift = math.hypot(float(frame.shift_x_px or 0.0), float(frame.shift_y_px or 0.0))
+    if not rotation_joint:
+        return float(shift)
+    return float(math.hypot(shift, rotation_in_plane_px(frame.rotation_deg, frame.r_rms_px)))
+
+
 def project_onto_direction(
     shift_x_px: float, shift_y_px: float, direction_deg: float
 ) -> float:
@@ -239,6 +385,8 @@ def process_segment(
     save_corners: bool = True,
     corners_dir: Path | None = None,
     metrics_path: Path | None = None,
+    vision_json_path: Path | None = None,
+    raw_available_after: bool = True,
     progress: Any = None,
     stop_requested: Any = None,
     stride: int = 1,
@@ -253,6 +401,11 @@ def process_segment(
     内回答"棋盘格还在不在、画面动没动、方向对不对"，而正式分析仍然用 ``stride=1``
     把每一帧都算一遍。抽掉的帧不是"跳过"，是**留到正式分析再算**——这一点写在这里，
     避免以后有人以为抽样结果就是最终结果。
+
+    ★ **要删 RAW 的路径必须 stride=1。** 抽帧处理之后若把 frames.raw 删掉，
+    被抽掉的那些帧的像素就永久没有了，"留到正式分析再算"这条退路随之消失。
+    所以生产路径（边采边清、离线分析）一律 stride=1，stride>1 只用于
+    **不删数据的现场预览**；``config.validate`` 会把两者的组合硬拦下来。
     """
     camera = vendor_module("camera")
     segment_id = segment_id or segment_dir.name
@@ -286,6 +439,7 @@ def process_segment(
                 centroid_y_px=None,
                 rotation_deg=None,
                 residual_px=None,
+                scale=None,
                 quality=None,
                 mm_per_pixel=None,
                 shift_x_px=None,
@@ -303,6 +457,8 @@ def process_segment(
                     frame.centroid_y_px = float(centroid[1])
                     frame.valid = True
                     frame.points_px = points
+                    # 角点到自身质心的均方根半径（J6 面内位移要用，见 FrameVision）。
+                    frame.r_rms_px = rms_radius_px(points)
                     if result.reference_frame_id is None:
                         result.reference_frame_id = frame.frame_id
                         # mm_per_pixel 直接取被复用代码算好的那个值，
@@ -334,14 +490,17 @@ def process_segment(
             frame.shift_x_px = float(centroid[0] - reference_centroid[0])
             frame.shift_y_px = float(centroid[1] - reference_centroid[1])
             try:
-                angle, residual, _scale = kabsch_rotation_about_centroid(
+                angle, residual, scale = kabsch_rotation_about_centroid(
                     reference, frame.points_px
                 )
                 frame.rotation_deg = angle
                 frame.residual_px = residual
+                # ★ 尺度留着，不再丢掉：轴向运动检查全靠它（需求四）。
+                frame.scale = float(scale)
             except VisionError:
                 frame.rotation_deg = None
                 frame.residual_px = None
+                frame.scale = None
 
     if save_corners:
         corner_rows, metric_rows = _collect_rows(result)
@@ -351,6 +510,12 @@ def process_segment(
             write_corners(corners_dir / f"{safe_name(segment_id)}.csv", corner_rows)
         if metrics_path is not None:
             append_metrics(metrics_path, metric_rows)
+    if vision_json_path is not None:
+        # 逐帧结果单独存一份：这是"边采边清"删掉 RAW 之后唯一能复算几何量的依据。
+        # raw_available_after 由调用方给：只有边采边清那条路径处理完会删 RAW。
+        save_vision_json(
+            Path(vision_json_path), result, stride=step, raw_available=raw_available_after
+        )
 
     return result
 
@@ -384,11 +549,140 @@ def _collect_rows(
                         "host_ns": frame.host_ns,
                         "analysis_time_s": _fmt(frame.analysis_time_s, 6),
                         "corner_index": index,
-                        "x_px": _fmt(float(x_coord), 4),
-                        "y_px": _fmt(float(y_coord), 4),
+                        # 6 位小数（1e-6 px），不是 4 位：角点 CSV 是"RAW 删掉之后
+                        # 复算几何量"的**唯一**观测量来源，4 位小数会在 200 px 力臂上
+                        # 留下约 3e-6° 的转角误差——比它要复现的那个量（0.2° 探针的
+                        # 图像转角约 6e-3°）小得多，但仍然是可以避免的。
+                        # 6 位之后从 CSV 复算的转角与存下来的值在 1e-6° 内一致。
+                        "x_px": _fmt(float(x_coord), 6),
+                        "y_px": _fmt(float(y_coord), 6),
                     }
                 )
     return corner_rows, metric_rows
+
+
+def save_vision_json(
+    path: Path, result: SegmentVision, *, stride: int = 1, raw_available: bool = True
+) -> Path:
+    """把这一段的逐帧结果存成 JSON（**不含角点**，角点单独存 CSV）。
+
+    这是"边采边清"能成立的关键：RAW 删掉之后，要复算这一段的视觉量，
+    靠的就是这份 JSON（逐帧质心/尺度/转角）+ 角点 CSV（原始观测量）。
+    两者加起来足以重算位移、转角和三层判据；但**不能**换一套角点检测
+    参数重新识别——那需要原始像素。这件事在 ``stride`` 和事件里都要写清楚。
+
+    ``raw_available`` 说的是**这份文件写完之后**段目录里还有没有 ``frames.raw``，
+    必须由调用方如实告诉它：只有"边采边清"那条路径才会删 RAW，
+    离线分析和回放路径写这份 JSON 的时候 RAW 明明还在。写死成 False
+    会让这些路径的 JSON 里躺着一句"RAW 已删除"的假话——将来有人拿它判断
+    "这段还能不能重新识别像素"，就会得出错的结论。
+    """
+    import json
+
+    if raw_available:
+        note = (
+            "本文件是这一段的逐帧结果（含质心、二维转角、尺度、r_rms、时间戳）。"
+            "段目录里的 frames.raw 仍在，换角点检测参数重识别随时可以重来；"
+            "本文件只是省掉重复识别，不是唯一副本。"
+            f"（处理步长 {int(stride)}；生产路径固定为 1，即每一帧都算过。）"
+        )
+    else:
+        note = (
+            "本文件由“分组流水线”就地处理生成：本组校验通过后 RAW 已删除。"
+            "逐帧几何量可直接复算（含质心、二维转角、尺度、r_rms、时间戳）；"
+            "若要换角点检测参数重识别，需要原始帧，本段已不可得"
+            f"（当时按步长 {int(stride)} 处理；生产路径固定为 1，即每一帧都算过）。"
+        )
+    payload = {
+        "segment_id": result.segment_id,
+        "segment_dir": str(result.segment_dir),
+        "reference_frame_id": result.reference_frame_id,
+        "mm_per_pixel": result.mm_per_pixel,
+        "seconds": float(result.seconds),
+        "synthetic": bool(result.synthetic),
+        "phases": list(result.phases),
+        "processed_stride": int(stride),
+        "raw_available": bool(raw_available),
+        "note": note,
+        "frames": [frame.to_json_dict() for frame in result.frames],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def load_segment_vision(
+    segment_dir: Path,
+    *,
+    segment_id: str | None = None,
+    corners_path: Path | None = None,
+) -> SegmentVision:
+    """从"边采边清"留下的 JSON（+角点 CSV）重建一段的视觉结果。
+
+    用途：RAW 被删掉之后再跑离线分析。没有 RAW 也没有 JSON 就明确报错，
+    **不返回空结果**——空结果会被下游当成"这段没动"，那是科研事故。
+    """
+    import json
+
+    segment_dir = Path(segment_dir)
+    name = segment_id or segment_dir.name
+    json_path = segment_dir / VISION_JSON_NAME
+    if not json_path.is_file():
+        raise VisionError(
+            f"{name}：既没有原始帧也没有逐帧结果（缺 {VISION_JSON_NAME}），无法复算。"
+        )
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    result = SegmentVision(
+        segment_id=str(payload.get("segment_id") or name),
+        segment_dir=segment_dir,
+    )
+    result.reference_frame_id = payload.get("reference_frame_id")
+    result.mm_per_pixel = payload.get("mm_per_pixel")
+    result.seconds = float(payload.get("seconds") or 0.0)
+    result.synthetic = bool(payload.get("synthetic", False))
+    result.phases = list(payload.get("phases") or [])
+    result.frames = [
+        FrameVision.from_json_dict(item) for item in payload.get("frames") or []
+    ]
+
+    points = read_corners(corners_path) if corners_path is not None else {}
+    if points:
+        for frame in result.frames:
+            frame.points_px = points.get(int(frame.frame_id))
+    return result
+
+
+#: 段目录里那份逐帧结果的固定文件名（"边采边清"要能按名找到它）。
+VISION_JSON_NAME = "segment_vision.json"
+
+
+def read_corners(path: Path | None) -> dict[int, np.ndarray]:
+    """读回角点 CSV，返回 ``{frame_id: 角点数组}``。文件不在就返回空字典。"""
+    import csv
+
+    if path is None or not Path(path).is_file():
+        return {}
+    grouped: dict[int, list[tuple[int, float, float]]] = {}
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                frame_id = int(row["frame_id"])
+                index = int(row["corner_index"])
+                x_coord = float(row["x_px"])
+                y_coord = float(row["y_px"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            grouped.setdefault(frame_id, []).append((index, x_coord, y_coord))
+    out: dict[int, np.ndarray] = {}
+    for frame_id, items in grouped.items():
+        items.sort(key=lambda item: item[0])
+        out[frame_id] = np.asarray(
+            [(x_coord, y_coord) for _index, x_coord, y_coord in items], dtype=np.float64
+        )
+    return out
 
 
 def write_corners(path: Path, rows: list[dict[str, Any]]) -> Path:
@@ -425,6 +719,11 @@ def append_metrics(path: Path, rows: list[dict[str, Any]]) -> None:
         "shift_y_px",
         "rotation_deg",
         "residual_px",
+        # ★ scale 与 r_rms_px 以前没列进来，于是 DictWriter 的 extrasaction="ignore"
+        # 把它们**静默**丢掉了：metrics.csv 里根本没有尺度列，而轴向/面内判据
+        # 恰恰要用它。列名写在这里，少一列就该看得见。
+        "scale",
+        "r_rms_px",
         "quality",
         "mm_per_pixel",
         "mean_brightness",
@@ -539,3 +838,262 @@ def in_plane_ratio_from_scale_change(
     if in_plane_mm <= 1e-9:
         return float("inf") if depth_mm > 1e-9 else 0.0
     return depth_mm / in_plane_mm
+
+
+# --------------------------------------------------------------------------
+# 轴向 / 面内运动判别（需求四）
+# --------------------------------------------------------------------------
+
+#: 判据里用的置信状态。三种都要能出现在报告里，不能只留"通过/不通过"。
+CONFIDENCE_RESOLVED = "resolved"
+CONFIDENCE_BELOW_RESOLUTION = "below_resolution"
+CONFIDENCE_UNAVAILABLE = "unavailable"
+
+#: 尺度分辨率的经验系数：分辨率取"参考窗口内尺度散布"的若干倍。
+#: 取 3 是常规的"三倍标准差"，低于它的尺度变化不可与噪声区分。
+SCALE_RESOLUTION_SIGMA = 3.0
+
+
+@dataclass
+class DepthInPlane:
+    """一次运动的轴向 / 面内分解结果。"""
+
+    #: 深度位移估计（mm）。置信状态为 below_resolution 时是 None
+    #: （那时只能给上限，见 ``depth_limit_mm``）。
+    depth_mm: float | None
+    #: 面内位移（mm），由质心二维位移 × 现场 mm/px 得到。
+    in_plane_mm: float | None
+    #: depth / in_plane。置信状态下才是实测比值；否则是 None。
+    ratio: float | None
+    #: 深度位移的**上限**（mm）：把"分辨不出来"的那一部分按最坏情况算进去。
+    depth_limit_mm: float | None
+    #: 用上限算出来的比值——判据就用它，因为它永远不会低估深度。
+    ratio_upper: float | None
+    #: 有效帧数（参与统计的帧）。
+    frames: int
+    #: 实测相对尺度（1.0 = 与参考帧同大）。
+    scale: float | None
+    #: 尺度噪声水平（单位与 scale 相同）。低于它就说"分辨不出来"。
+    scale_noise: float | None
+    #: 上面那个噪声对应的深度（mm）。
+    resolution_mm: float | None
+    #: resolved / below_resolution / unavailable
+    confidence: str = CONFIDENCE_UNAVAILABLE
+    note: str = ""
+
+    @property
+    def decided(self) -> bool:
+        return self.confidence == CONFIDENCE_RESOLVED
+
+    @property
+    def judgement_text(self) -> str:
+        """一句话结论（报告和日志共用，措辞保持一致）。"""
+        if self.confidence == CONFIDENCE_UNAVAILABLE:
+            return f"无法判断（{self.note}）"
+        if self.confidence == CONFIDENCE_BELOW_RESOLUTION:
+            return (
+                f"深度变化低于可分辨下限（{self.resolution_mm:.4f} mm），"
+                f"无法判断实际深度，只能给上限 {self.depth_limit_mm:.4f} mm"
+            )
+        return f"深度 {self.depth_mm:.4f} mm，面内 {self.in_plane_mm:.4f} mm"
+
+    def to_lines(self) -> list[str]:
+        lines = [
+            f"轴向（深度）位移：{self._fmt_or(self.depth_mm, '低于可分辨下限')} mm",
+            f"面内位移：{self._fmt_or(self.in_plane_mm)} mm",
+            f"深度/面内 比值：{self._fmt_or(self.ratio)}"
+            + ("" if self.decided else f"（上限 {self._fmt_or(self.ratio_upper)}）"),
+            f"有效帧数：{self.frames}",
+            f"置信状态：{self.confidence}（{self.judgement_text}）",
+        ]
+        if self.scale is not None and self.scale_noise is not None:
+            lines.append(
+                f"实测尺度：{self.scale:.7f}，尺度噪声 ±{self.scale_noise:.7f}"
+                f"（≈ {self._fmt_or(self.resolution_mm)} mm 深度）"
+            )
+        return lines
+
+    @staticmethod
+    def _fmt_or(value: float | None, fallback: str = "无法判断") -> str:
+        return fallback if value is None else f"{float(value):.4f}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "depth_mm": self.depth_mm,
+            "in_plane_mm": self.in_plane_mm,
+            "ratio": self.ratio,
+            "depth_limit_mm": self.depth_limit_mm,
+            "ratio_upper": self.ratio_upper,
+            "frames": int(self.frames),
+            "scale": self.scale,
+            "scale_noise": self.scale_noise,
+            "resolution_mm": self.resolution_mm,
+            "confidence": self.confidence,
+            "note": self.note,
+        }
+
+
+def scale_noise_level(frames: Sequence[FrameVision]) -> float | None:
+    """从一组**静止**帧估尺度噪声：尺度散布的标准差。
+
+    为什么不用一个拍脑袋的常数：尺度噪声取决于棋盘格在画面里有多大、角点定位
+    精度多高（半像素级），换一块板子、换一个 ROI 就全变了。用同一段数据自己算，
+    判据才跟着现场走。
+    """
+    values = [
+        float(frame.scale)
+        for frame in frames
+        if frame.valid and frame.scale is not None
+    ]
+    if len(values) < 3:
+        return None
+    return float(np.std(np.asarray(values, dtype=float), ddof=1))
+
+
+def estimate_depth_in_plane(
+    frames: Sequence[FrameVision],
+    *,
+    config: AppConfig,
+    noise_frames: Sequence[FrameVision] | None = None,
+    rotation_joint: bool = False,
+) -> DepthInPlane:
+    """把一段运动里的逐帧结果分解成"轴向位移 / 面内位移"（需求四）。
+
+    口径（三条都要写清楚，否则数字没法复核）：
+
+    1. **深度**：``depth_mm = working_distance_mm × |scale − 1|``。
+       小孔成像的一阶近似——物体离相机近 s 倍，成像就大 s 倍。
+       这是**量级估计**，不当作位移测量值用。
+    2. **面内**：``in_plane_mm = d_plane_px × mm_per_pixel``，
+       其中 ``d_plane_px`` 按关节分两种（见 :func:`in_plane_px_of_frame`）：
+
+       * J1～J5：``|质心二维位移|``；
+       * **J6**：``√(质心二维位移² + (2·r_rms·sin(|θ|/2))²)``。
+         J6 绕自身轴转，棋盘格可能**偏心** 5～15 mm，所以既不能只看质心平移
+         （棋盘格装得越正、质心越不动，运动反而被判成 0），也不能假设它居中
+         （偏心量是安装公差，不该进运动量）。两项合成之后，
+         "居中"和"偏心 15 mm"的纯转动会得到同一个量级的面内位移。
+
+       mm_per_pixel 用被复用代码由角点间距算出的那个值，和"像素→毫米"的旧口径一致。
+       **J6 的角度本身仍然只用 88 角点去质心后的二维 Kabsch 旋转**，
+       绝不用"质心圆弧位移 ÷ 假定偏心距离"反推——那样量到的是安装偏心，
+       不是关节转角。
+    3. **可分辨性**：尺度噪声取 ``noise_frames``（静止段）里尺度的标准差 σ，
+       分辨率 = ``SCALE_RESOLUTION_SIGMA × σ``。若实测 |scale−1| 小于它，
+       就**不报实测深度**，而是报"低于可分辨下限 + 一个上限"：
+
+           depth_limit_mm = working_distance_mm × max(|scale−1|, 分辨率)
+
+       判据（:attr:`DepthInPlane.ratio_upper`）永远用这个上限，
+       所以"分辨不出来"**永远不会**被当成"深度很小、放心通过"——
+       只有当上限本身都远小于面内位移时，才敢说"以面内运动为主"。
+       如果上限已经大到压不住，就如实报 ``below_resolution`` 并由调用方暂停。
+    """
+    signal = [
+        frame for frame in frames if frame.valid and frame.centroid_x_px is not None
+    ]
+    result = DepthInPlane(
+        depth_mm=None,
+        in_plane_mm=None,
+        ratio=None,
+        depth_limit_mm=None,
+        ratio_upper=None,
+        frames=len(signal),
+        scale=None,
+        scale_noise=None,
+        resolution_mm=None,
+    )
+    working_distance = float(config.camera.working_distance_mm)
+    if not signal:
+        result.note = "这一段没有有效帧"
+        return result
+
+    # 运动量取"窗口内相对参考帧的最大位移"：微动是一去一回的动作，
+    # 用末帧差值会被回程抵消掉，用最大值才代表这次运动到底走了多少。
+    # ★ J6 走"平移 + 转动合成"，见 in_plane_px_of_frame：棋盘格居中时质心不动，
+    # 只看平移会把一次真实的转动量成 0。
+    in_plane_px = max(
+        in_plane_px_of_frame(frame, rotation_joint=rotation_joint) for frame in signal
+    )
+    mm_per_pixel = None
+    for frame in signal:
+        if frame.mm_per_pixel:
+            mm_per_pixel = float(frame.mm_per_pixel)
+            break
+    if mm_per_pixel is None:
+        mm_per_pixel = 0.0
+        result.note = "没有 mm/像素 标定值（棋盘格识别没给出格距），面内位移按 0 计"
+    result.in_plane_mm = float(in_plane_px * mm_per_pixel)
+
+    scales = [float(frame.scale) for frame in signal if frame.scale is not None]
+    if not scales:
+        result.note = (result.note + "；" if result.note else "") + "这一段算不出尺度"
+        return result
+    scale = max(scales, key=lambda value: abs(value - 1.0))
+    result.scale = float(scale)
+    deviation = abs(float(scale) - 1.0)
+
+    noise_source = [
+        frame
+        for frame in (noise_frames or [])
+        if frame.valid and frame.scale is not None
+    ]
+    result.scale_noise = scale_noise_level(noise_source) if len(noise_source) >= 3 else None
+    if result.scale_noise is None:
+        # 没有静止段可以参考，就不能声称自己分辨得出深度——如实说。
+        result.confidence = CONFIDENCE_UNAVAILABLE
+        result.note = "本段没有可用的静止参考帧，尺度噪声未知，无法判断"
+        return result
+
+    resolution = float(SCALE_RESOLUTION_SIGMA) * float(result.scale_noise)
+    result.resolution_mm = float(resolution * working_distance)
+    resolved = deviation >= resolution
+
+    if resolved:
+        result.confidence = CONFIDENCE_RESOLVED
+        result.depth_mm = float(deviation * working_distance)
+        result.depth_limit_mm = result.depth_mm
+    else:
+        result.confidence = CONFIDENCE_BELOW_RESOLUTION
+        result.depth_limit_mm = float(resolution * working_distance)
+    result.ratio_upper = _safe_ratio(result.depth_limit_mm, result.in_plane_mm)
+    if resolved:
+        result.ratio = _safe_ratio(result.depth_mm, result.in_plane_mm)
+    if result.in_plane_mm <= 1e-9:
+        result.note = "面内位移为 0（画面没动），比值无意义"
+    return result
+
+
+def _safe_ratio(depth_mm: float | None, in_plane_mm: float | None) -> float | None:
+    if depth_mm is None or in_plane_mm is None:
+        return None
+    if in_plane_mm <= 1e-9:
+        return float("inf") if depth_mm > 1e-9 else 0.0
+    return float(depth_mm / in_plane_mm)
+
+
+def judge_in_plane_dominant(
+    estimate: DepthInPlane, *, max_depth_ratio: float
+) -> tuple[bool, str]:
+    """按 ``thresholds.max_depth_ratio`` 放行或暂停。返回 (是否放行, 中文原因)。
+
+    判据用的是**上限**比值：宁可把深度算大，也不许因为"分辨不出来"而漏过轴向运动。
+    """
+    limit = float(max_depth_ratio)
+    if estimate.ratio_upper is None:
+        return False, f"无法判断（{estimate.note or '缺少数据'}）"
+    if estimate.ratio_upper <= limit:
+        if estimate.confidence == CONFIDENCE_RESOLVED:
+            return True, (
+                f"深度/面内 = {estimate.ratio_upper:.3f} ≤ {limit}"
+                f"（深度 {estimate.depth_mm:.4f} mm，面内 {estimate.in_plane_mm:.4f} mm）"
+            )
+        return True, (
+            f"深度变化低于可分辨下限，无法判断实际深度；"
+            f"即使按上限 {estimate.depth_limit_mm:.4f} mm 算，深度/面内 = "
+            f"{estimate.ratio_upper:.3f} 仍 ≤ {limit}，认定以面内运动为主"
+        )
+    return False, (
+        f"深度/面内 = {estimate.ratio_upper:.3f} > {limit}，轴向分量偏大："
+        f"{estimate.judgement_text}"
+    )

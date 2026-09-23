@@ -37,6 +37,7 @@
       8
     ],
     "square_mm": 3.0,
+    "working_distance_mm": 675.0,
     "static_duration_s": 15.0,
     "post_motion_s": 0.3,
     "pre_motion_s": 0.3,
@@ -55,7 +56,7 @@
       0.2
     ],
     "repeats_per_direction": 2,
-    "quick_probe_deg": 0.05,
+    "quick_probe_deg": 0.2,
     "joints": [
       "J1"
     ],
@@ -115,7 +116,13 @@
   },
   "paths": {
     "output_root": "outputs",
-    "min_free_disk_gb": 2.0
+    "min_free_disk_gb": 2.0,
+    "delete_raw_after_process": false,
+    "process_stride": 1,
+    "process_headroom": 1.15,
+    "derived_overhead_ratio": 0.05,
+    "max_peak_disk_gb": 50.0,
+    "disk_warn_gb": 40.0
   },
   "dry_run": {
     "width": 480,

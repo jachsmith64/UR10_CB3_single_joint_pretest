@@ -55,6 +55,7 @@ from .kinematics import (
 from .vision import (
     FrameVision,
     SegmentVision,
+    estimate_depth_in_plane,
     expected_image_direction_deg,
 )
 
@@ -156,6 +157,22 @@ class TrialMetrics:
     pre_frames: int = 0
     steady_frames: int = 0
 
+    # -- 轴向 / 面内分解（需求四） ---------------------------------------
+    #: 由棋盘格相似变换的尺度变化估的轴向位移（mm）。见 vision.estimate_depth_in_plane。
+    depth_mm: float | None = None
+    #: 由质心二维位移 × 现场 mm/px 得到的面内位移（mm）。
+    in_plane_mm: float | None = None
+    #: depth / in_plane（仅在尺度可分辨时给出）。
+    depth_ratio: float | None = None
+    #: 用深度**上限**算出的比值——判据用的就是它。
+    depth_ratio_upper: float | None = None
+    #: 参与分解的有效帧数。
+    depth_frames: int = 0
+    #: resolved / below_resolution / unavailable（含义见 vision 里的同名常量）。
+    depth_confidence: str = ""
+    #: 一句话结论（含"无法判断"这类如实表述）。
+    depth_note: str = ""
+
     # -- 第三层：动态残差 -------------------------------------------------
     residual_px: float | None = None
     residual_ratio: float | None = None
@@ -208,6 +225,13 @@ class TrialMetrics:
             "snr": _r(self.snr, 4),
             "pre_frames": self.pre_frames,
             "steady_frames": self.steady_frames,
+            "depth_mm": _r(self.depth_mm, 5),
+            "in_plane_mm": _r(self.in_plane_mm, 5),
+            "depth_ratio": _r(self.depth_ratio, 4),
+            "depth_ratio_upper": _r(self.depth_ratio_upper, 4),
+            "depth_frames": self.depth_frames,
+            "depth_confidence": self.depth_confidence,
+            "depth_note": self.depth_note,
             "residual_px": _r(self.residual_px, 5),
             "residual_deg": _r(self.residual_deg, 6),
             "residual_ratio": _r(self.residual_ratio, 4),
@@ -575,11 +599,144 @@ def analyze_trial(
     # -- 第二层：实际 → 画面 ---------------------------------------------
     _fill_vision_layer(metrics, segment, direction, static_noise)
 
+    # -- 轴向/面内分解（需求四） -----------------------------------------
+    _fill_depth_layer(metrics, segment, config=config)
+
     # -- 第三层：动态残差 -------------------------------------------------
     _fill_residual_layer(metrics, segment, direction, config)
 
     _collect_issues(metrics, segment, thresholds)
     return metrics
+
+
+def _fill_depth_layer(
+    metrics: TrialMetrics, segment: SegmentVision, *, config: AppConfig
+) -> None:
+    """把这一段分解成"轴向位移 / 面内位移"，并如实标出置信状态。
+
+    窗口口径与第二层一致：**保持窗口的后半段**当信号（前半段还带着到位余振），
+    运动前 + 运动后两段静止帧当噪声池（同时也用来估尺度噪声）。
+    这样"深度比"和"位移"是同一段画面上量出来的，不会互相打架。
+    """
+    hold_window = _phase_window(segment, PHASE_HOLD)
+    if hold_window is None:
+        metrics.depth_note = "缺少保持段相位信息，无法分解"
+        return
+    hold_start, hold_end = hold_window
+    steady_start = hold_start + 0.5 * (hold_end - hold_start)
+    signal = _window_frames(segment, steady_start, hold_end)
+    noise: list[FrameVision] = []
+    for phase in (PHASE_PRE, PHASE_POST):
+        window = _phase_window(segment, phase)
+        if window is not None:
+            noise.extend(_window_frames(segment, *window))
+
+    estimate = estimate_depth_in_plane(
+        signal,
+        config=config,
+        noise_frames=noise,
+        # ★ J6 的面内位移要加上"转动扫过的位移"（见 vision.in_plane_px_of_frame）：
+        # 棋盘格可能偏心装，只看质心平移会把它的面内运动量小看甚至量成 0，
+        # 那样深度/面内比值就会被抬高，一次纯转动可能被误判成"轴向偏大"。
+        rotation_joint=str(metrics.joint) in set(config.vision.rotation_joints),
+    )
+    metrics.depth_mm = estimate.depth_mm
+    metrics.in_plane_mm = estimate.in_plane_mm
+    metrics.depth_ratio = estimate.ratio
+    metrics.depth_ratio_upper = estimate.ratio_upper
+    metrics.depth_frames = estimate.frames
+    metrics.depth_confidence = estimate.confidence
+    metrics.depth_note = estimate.judgement_text
+
+
+def check_segment_analyzable(
+    segment: SegmentVision, *, config: AppConfig, kind: str = "", joint: str = ""
+) -> tuple[bool, str]:
+    """删 RAW 之前的最后一道：**本段的基本分析真的跑得完吗**。
+
+    为什么不能只看"有效帧比例"：比例高不代表算得出来。一个典型的坏情况是
+    "保持段一帧都没有"——valid_ratio 仍然可能很高（运动前/运动后都是静止帧），
+    但第二层的信号窗口是空的，第三层的残差也没有基准，这一段事后就是废数据，
+    而那时 RAW 已经删了。所以这里按**分析层真正用的那几件事**逐件试跑一遍：
+
+    1. 相位表里声明的每个阶段，窗口内都要有 ≥ ``thresholds.min_window_frames`` 帧；
+    2. 保持窗口的后半段（信号窗）要够；
+    3. 运动前 + 运动后（噪声池）要够——没有它就没有"信噪比"这把尺子；
+    4. ``estimate_depth_in_plane`` 要能给出结论（不能是 ``unavailable``）；
+    5. 质心与二维转角至少有一个算得出来（否则第二层无从下手）。
+
+    静态基线段走另一条路：它的"基本分析"就是 ``analyze_static``，
+    所以这里直接调它一次，调得通就算过。
+
+    ``joint`` 由调用方给出（段自己不带关节名——``SegmentVision`` 是视觉层类型，
+    只管像素）。它只影响第 4 步的面内位移口径：J6 要把转动扫过的位移算进去。
+
+    返回 ``(能不能分析, 中文原因)``。**失败一律保留 RAW**，由调用方暂停。
+    """
+    thresholds = config.thresholds
+    min_frames = int(thresholds.min_window_frames)
+    if str(kind) == "static" or not getattr(segment, "phases", None):
+        try:
+            noise = analyze_static(segment)
+        except Exception as exc:
+            return False, f"静态基线的基本分析跑不完：{exc}"
+        if noise.frames <= 0 or not np.isfinite(noise.std_radial_px):
+            return False, "静态基线算不出噪声水平"
+        return True, "静态基线分析通过"
+
+    # 1) 声明了的每个阶段都要有足够有效帧。
+    for entry in segment.phases:
+        label = str(entry.get("label") or "")
+        if not label:
+            return False, "相位表里有条目没有 label"
+        try:
+            start_s, end_s = float(entry["start_s"]), float(entry["end_s"])
+        except (KeyError, TypeError, ValueError):
+            return False, f"相位 {label} 缺 start_s/end_s"
+        count = len(_window_frames(segment, start_s, end_s))
+        if count < min_frames:
+            return False, (
+                f"阶段「{label}」只有 {count} 帧有效帧（要求 ≥ {min_frames}）："
+                "这个阶段的分析做不了，保留 RAW"
+            )
+
+    hold_window = _phase_window(segment, PHASE_HOLD)
+    if hold_window is None:
+        return False, "相位表里没有保持段（hold），第二层分析没有信号窗"
+    hold_start, hold_end = hold_window
+    steady_start = hold_start + 0.5 * (hold_end - hold_start)
+    signal = _window_frames(segment, steady_start, hold_end)
+    if len(signal) < min_frames:
+        return False, (
+            f"保持段后半（信号窗）只有 {len(signal)} 帧有效帧"
+            f"（要求 ≥ {min_frames}）"
+        )
+
+    noise: list[FrameVision] = []
+    for phase in (PHASE_PRE, PHASE_POST):
+        window = _phase_window(segment, phase)
+        if window is not None:
+            noise.extend(_window_frames(segment, *window))
+    if len(noise) < min_frames:
+        return False, (
+            f"运动前 + 运动后的静止帧只有 {len(noise)} 帧"
+            f"（要求 ≥ {min_frames}）：没有噪声池就算不出信噪比和尺度噪声"
+        )
+
+    estimate = estimate_depth_in_plane(
+        signal,
+        config=config,
+        noise_frames=noise,
+        rotation_joint=str(joint) in set(config.vision.rotation_joints),
+    )
+    if estimate.confidence == "unavailable":
+        return False, f"轴向/面内分解算不出来：{estimate.note}"
+    if _mean_dx_dy(signal) is None and _mean_rotation(signal) is None:
+        return False, "保持段既算不出质心也算不出转角，第二层分析无从下手"
+    return True, (
+        f"本段基本分析通过（信号 {len(signal)} 帧、噪声池 {len(noise)} 帧、"
+        f"轴向/面内置信状态 {estimate.confidence}）"
+    )
 
 
 def _phase_window(segment: SegmentVision, phase: str) -> tuple[float, float] | None:
@@ -888,6 +1045,16 @@ def _collect_issues(
             metrics.rotation_deg is None
         ):
             metrics.issues.append("视觉这一路没有算出任何位移。")
+    # 轴向分量偏大：写进这一条的 issues 里，人在看 trials.csv 时能一眼找到它
+    # （它不参与 no_blocking_problem 那个"致命问题"的判定，由 in_plane_dominant
+    #  这条专门的判据负责，见 summarize_amplitudes）。
+    if metrics.depth_ratio_upper is not None and (
+        metrics.depth_ratio_upper > float(thresholds.max_depth_ratio)
+    ):
+        metrics.issues.append(
+            f"轴向分量偏大：深度/面内 = {metrics.depth_ratio_upper:.3f} > "
+            f"{thresholds.max_depth_ratio}（{metrics.depth_note}）"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1077,6 +1244,35 @@ def summarize_amplitudes(
             if "超时" in issue or "无法计算" in issue
         ]
         checks["no_blocking_problem"] = not fatal
+
+        # 7) 以面内运动为主（需求四）：深度/面内 比值不超过 max_depth_ratio，
+        #    而且判据用的是深度的**上限**——分辨不出来时按最坏情况算，不许蒙混过关。
+        depth_trials = [t for t in bucket.trials if t.depth_confidence]
+        if not depth_trials:
+            # 整批都没有轴向/面内数据（缺静态参考帧之类）：这一条**不判**，
+            # 但要说清楚为什么不判，并且不把它算进"通过"里当作已经验过。
+            bucket.notes.append(
+                "轴向/面内分解：本批数据全部没有可用结果（缺静止参考帧或算不出尺度），"
+                "这一条**未评估**——不要当成“已确认以面内运动为主”。"
+            )
+        else:
+            worst = None
+            for trial in depth_trials:
+                if trial.depth_ratio_upper is None:
+                    worst = float("inf")
+                elif worst is None or trial.depth_ratio_upper > worst:
+                    worst = trial.depth_ratio_upper
+            checks["in_plane_dominant"] = bool(
+                worst is not None and worst <= float(thresholds.max_depth_ratio)
+            )
+            if worst is not None and worst != float("inf"):
+                bucket.notes.append(
+                    f"轴向/面内比值（取上限）最大 {worst:.4f}，"
+                    f"上限 {thresholds.max_depth_ratio}"
+                )
+            for trial in depth_trials:
+                if trial.depth_note:
+                    bucket.notes.append(f"{trial.event_id}：{trial.depth_note}")
 
         bucket.checks = checks
         if noise is not None and mean_abs is not None:

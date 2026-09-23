@@ -68,9 +68,14 @@ PARAMETER_SPEC: tuple[tuple[str, str, str], ...] = (
     ("相机", "camera.warmup_s", "float"),
     ("相机", "camera.board_inner_corners", "ints"),
     ("相机", "camera.square_mm", "float"),
+    # ★ 工作距离：只用来把"棋盘格在画面里变大/变小了多少"换算成轴向位移。
+    # 现场量一次相机到板面的竖直距离填进来。
+    ("相机", "camera.working_distance_mm", "float"),
     ("相机", "camera.roi", "optional_ints"),
     ("相机", "camera.min_margin_px", "int"),
     ("相机", "camera.max_dropped_ratio", "float"),
+    # save_raw 说明：本工具**不允许**关掉原始帧落盘（关掉就没有可复核的原始数据了）。
+    # 盘不够请用下面输出组里的"边采边清"。
     ("相机", "camera.save_raw", "bool"),
     ("相机", "camera.save_sample_images", "bool"),
     ("预实验", "pretest.joints", "strs"),
@@ -100,8 +105,22 @@ PARAMETER_SPEC: tuple[tuple[str, str, str], ...] = (
     ("判据", "thresholds.max_repeat_relative_spread", "float"),
     ("判据", "thresholds.direction_tolerance_deg", "float"),
     ("判据", "thresholds.residual_factor", "float"),
+    ("判据", "thresholds.max_depth_ratio", "float"),
     ("输出", "paths.output_root", "str"),
     ("输出", "paths.min_free_disk_gb", "float"),
+    # ★ 分组流水线（需求一）：**一组动作全部走完、机械臂停稳之后**整组处理，
+    # 落盘角点+逐帧结果并回读校验，通过了才删这一组的 RAW。
+    # 打开它，盘上任何时刻只有当前这一组（800×600 约 22 GB、950×800 约 36 GB），
+    # 而不是整场的总和（200～350 GB）。组的划分见 experiment.begin_group。
+    ("输出", "paths.delete_raw_after_process", "bool"),
+    # ★ 就地处理的步长。删 RAW 之前必须是 1（每一帧都算过），配置校验会硬拦。
+    # 4 只能用在"不删数据"的现场快速预览上。
+    ("输出", "paths.process_stride", "int"),
+    # ★ 峰值闸门：估算超过预警线就放行但预警，超过硬上限就**不得开始这一组**。
+    # 现场口径：任意时刻 RAW + 临时文件不超过 50 GB，建议预警线 35～40 GB。
+    ("输出", "paths.max_peak_disk_gb", "float"),
+    ("输出", "paths.disk_warn_gb", "float"),
+    ("输出", "paths.derived_overhead_ratio", "float"),
 )
 
 
@@ -816,8 +835,9 @@ class ExperimentApp:
             if not enable:
                 raise UiError(f"配置里已关闭组{group}（formal.enable_group_{group.lower()}）。")
             session = self._open_session(f"formal_{group}")
-            if group == "A":
-                self._range_check_then_confirm(session, steps)
+            # ★ 组 A 和组 B 之前**都**要过这一道（需求五）：两组都在真机上走
+            # 单向爬梯，B 的行程同样是 A 的 N 倍，只查 A 等于让 B 裸奔。
+            self._range_check_then_confirm(session, steps, group=group)
             if self.session is session and session.approach_needed():
                 self.append_log("当前姿态不在实验姿态附近，先走到位（每一步仍会问人）。")
                 result = session.run_approach()
@@ -829,9 +849,14 @@ class ExperimentApp:
         self._run_task(f"正式实验 组{group}", work)
 
     def _range_check_then_confirm(
-        self, session: ExperimentSession, steps: Mapping[str, float]
+        self, session: ExperimentSession, steps: Mapping[str, float], *, group: str
     ) -> None:
-        """组A 之前的理论范围检查。**不是碰撞检查**，措辞不能含糊。"""
+        """组{group} 之前的理论范围检查。**不是碰撞检查**，措辞不能含糊。
+
+        ★ 组 A 和组 B 共用这一道：组 B 的行程是 A 的 N 倍，只查 A 是不够的。
+        这里做的是**人机确认**这一步；真正的数值检查在
+        ``ExperimentSession.run_formal`` 里也会自己跑一遍，界面上漏掉也不会漏检。
+        """
         if not self.config.formal.require_range_check:
             self.append_log("配置里关掉了理论范围检查（formal.require_range_check=false）。")
             return
@@ -839,14 +864,14 @@ class ExperimentApp:
         for line in lines:
             self.append_log(line)
         question = (
-            "组A 之前的理论范围检查结果：\n\n"
+            f"组{group} 之前的理论范围检查结果：\n\n"
             + "\n".join(lines)
             + "\n\n提醒：理论检查用的是名义运动学，**不等于碰撞安全**。"
             "真实碰撞状态记为 unknown，请人工核对现场。\n\n"
-            "确认之后开始组A（单向爬梯后返回）吗？"
+            f"确认之后开始组{group}吗？"
         )
         if not self._ask(question):
-            raise UiError("操作者没有确认理论范围检查，组A 不开始。")
+            raise UiError(f"操作者没有确认理论范围检查，组{group} 不开始。")
 
     # -- 停止 -------------------------------------------------------------
 

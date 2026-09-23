@@ -260,6 +260,14 @@ class CameraConfig:
     #: 棋盘格：12×9 方格 → 11×8 内角点 → 88 个角点；小格 3 mm。
     board_inner_corners: list[int] = field(default_factory=lambda: [11, 8])
     square_mm: float = 3.0
+    #: 相机到棋盘格的**竖直**工作距离（mm）。默认 675 = 需求二给的摆放提示。
+    #:
+    #: ★ 它只用来把"棋盘格在画面里变大/变小了多少"换算成**轴向位移**：
+    #: depth_mm ≈ working_distance_mm × |scale − 1|
+    #: （小孔成像的一阶近似：Z' = Z·s，所以 ΔZ = Z·(s−1)）。
+    #: 现场实际测一次相机到板面的距离填进来即可；填错只影响轴向位移的**比例**，
+    #: 不影响"面内为主 / 有轴向分量"这个判断的方向（比例是单调的）。
+    working_distance_mm: float = float(DEFAULT_CAMERA_HINT["working_distance_mm"])
 
     #: 采集时长（秒）。静态噪声测量默认 15 s（需求允许 10～20 s）。
     static_duration_s: float = 15.0
@@ -316,6 +324,10 @@ class CameraConfig:
             # 需求四要求 88 个内角点，这里只提醒不阻断（换板子的人自己清楚）。
             pass
         _positive(_as_float(self.square_mm, f"{where}.square_mm"), f"{where}.square_mm")
+        _positive(
+            _as_float(self.working_distance_mm, f"{where}.working_distance_mm"),
+            f"{where}.working_distance_mm",
+        )
 
         static_s = _positive(
             _as_float(self.static_duration_s, f"{where}.static_duration_s"),
@@ -368,8 +380,12 @@ class PretestConfig:
     )
     #: 每个幅值、每个方向重复几次（需求：正负各 2 次）。
     repeats_per_direction: int = 2
-    #: 快速几何确认用的试探步长（需求：每个关节先用 0.05° 试一次）。
-    quick_probe_deg: float = 0.05
+    #: 快速几何确认用的试探步长（度）。
+    #: ★ 默认为 0.2 而不是 0.05：快速确认要同时判"面内位移够不够"和
+    #: "轴向位移占比大不大"，0.05° 的位移在真机上只有几个像素，
+    #: 轴向那一项根本分辨不出来，会一路报"无法判断"。
+    #: 0.2° 是"仍属微动、但图像上信噪比够看"的折中，界面上可以改。
+    quick_probe_deg: float = 0.2
     #: 参与预实验的关节顺序。
     joints: list[str] = field(default_factory=lambda: list(JOINT_NAMES))
     #: 每个新关节开始前是否要人工确认（需求要求保留）。
@@ -665,6 +681,45 @@ class PathConfig:
     #: 开始任何采集前要求的可用磁盘空间下限（GB）。
     min_free_disk_gb: float = 2.0
 
+    #: ★ 边采边清（分组流水线）：一组动作全部采完之后、机械臂停着不动的时候，
+    #: 把这一组**整组**处理掉，角点表与逐帧几何**先落盘并校验**，
+    #: 校验通过才删掉这一组的 frames.raw，然后才进入下一组运动。
+    #: 目的：让盘上任何时刻只有"当前这一组"的几十 GB 原始视频，
+    #: 而不是整场几百 GB（整场 800×600 约 222 GB，950×800 约 352 GB）。
+    #:
+    #: 默认 False（保持"原始数据一律留盘"的交付行为）。
+    #: 打开它换来的代价必须说清楚：RAW 删掉之后**只能**用保存下来的角点复算，
+    #: 不能再换一套角点检测参数重跑识别；所以每段都会写一条 raw_deleted 事件，
+    #: 记下删除的大小、帧数和 sha256，事后能证明"这一段处理过什么、删了什么"。
+    #: 处理失败或校验不过时**不删**，宁可占盘，并且**暂停**等人处理。
+    delete_raw_after_process: bool = False
+    #: 就地处理这一遍的抽帧步长（1 = 每帧都识别）。
+    #:
+    #: ★ 默认 **1**：删 RAW 之前必须按 132 Hz 把**每一帧**的角点和视觉结果算出来并落盘。
+    #: 一旦抽帧，被抽掉的那些帧的原始像素随 RAW 一起消失，事后**无法**补算——
+    #: 那不是"省时间"，是永久丢数据。步长 > 1 只允许出现在**现场快速预览**这一类
+    #: 不删数据的场合（见 ``experiment.QUICK_PROBE_STRIDE``）。
+    #: 所以 ``delete_raw_after_process=True`` 时本项必须为 1，``validate`` 会硬拦。
+    process_stride: int = 1
+    #: 就地处理阶段的磁盘余量系数：处理是有中间产物的，别把盘顶死。
+    process_headroom: float = 1.15
+    #: 派生数据（88 角点 CSV + 逐帧 segment_vision.json + 元数据）相对 RAW 的比例。
+    #: 现场实测约 1%：每帧 RAW 是 800×600=480000 字节，角点 88×~45 字节、
+    #: 逐帧 JSON 约 400 字节。这里取 5% 是**故意往多了算**——留出写盘临时文件
+    #: （.tmp）、事件日志、RTDE 状态流和样本图的空间，宁可早一点拦。
+    derived_overhead_ratio: float = 0.05
+    #: ★ 硬上限（GB）：盘上 RAW + 临时文件的总占用**任何时刻**都不得超过它。
+    #: 超过就**不得开始下一组**——在一组开始之前按这一组的计划估算，超了直接拒绝。
+    max_peak_disk_gb: float = 50.0
+    #: ★ 预警线（GB）：估算超过它就放行但**明确预警**，让人先去清盘或裁 ROI。
+    #:
+    #: 现场要求 35～40 GB；取区间上限 40，理由是两个交付 ROI 档的**最坏一组**
+    #: 都在它下面（800×600 约 22.4 GB、950×800 约 35.5 GB，见
+    #: ``tests/test_group_pipeline.py`` 的实测断言）。取 35 的话 950×800 这一档
+    #: 自己就会天天踩线报警，报警变成噪声就没人看了；取 40 则它只在"比交付
+    #: 建议的 ROI 还大"时才响，正好是"该清盘或该裁 ROI 了"的时刻。
+    disk_warn_gb: float = 40.0
+
     def validate(self) -> None:
         _as_str(self.output_root, "paths.output_root")
         if not self.output_root.strip():
@@ -676,6 +731,48 @@ class PathConfig:
         if free > 200:
             raise ConfigError(
                 f"paths.min_free_disk_gb = {free} GB 过于苛刻（上限 200 GB）。"
+            )
+        delete_raw = _as_bool(
+            self.delete_raw_after_process, "paths.delete_raw_after_process"
+        )
+        stride = _as_int(self.process_stride, "paths.process_stride")
+        if stride < 1:
+            raise ConfigError(f"paths.process_stride 必须 ≥ 1，收到 {stride}")
+        if delete_raw and stride != 1:
+            # 需求四：stride>1 只能用于**不删数据**的现场快速预览。
+            # 删 RAW 之前按步长抽帧 = 把没算的那几分之几帧的原始像素永久丢掉，
+            # 事后既不能补算、也不能换检测参数重识别。这一条必须硬拦，
+            # 因为它错起来是**静默**的：报告照样出，只是每 4 帧才有一帧。
+            raise ConfigError(
+                f"paths.delete_raw_after_process=true 时 paths.process_stride 必须为 1，"
+                f"收到 {stride}。删 RAW 之前必须按 132 Hz 把每一帧的角点和视觉结果"
+                "算出来落盘；抽帧只允许用在“不删数据”的现场快速预览上。"
+                "（要么把 process_stride 改回 1，要么先把边采边清关掉。）"
+            )
+        headroom = _as_float(self.process_headroom, "paths.process_headroom")
+        if headroom < 1.0:
+            raise ConfigError(
+                f"paths.process_headroom 必须 ≥ 1，收到 {headroom}（1.15 表示留 15% 余量）"
+            )
+        ratio = _non_negative(
+            _as_float(self.derived_overhead_ratio, "paths.derived_overhead_ratio"),
+            "paths.derived_overhead_ratio",
+        )
+        if ratio > 1.0:
+            raise ConfigError(
+                f"paths.derived_overhead_ratio = {ratio} 过大（派生数据不该超过 RAW 本身）。"
+            )
+        peak = _positive(
+            _as_float(self.max_peak_disk_gb, "paths.max_peak_disk_gb"),
+            "paths.max_peak_disk_gb",
+        )
+        warn = _non_negative(
+            _as_float(self.disk_warn_gb, "paths.disk_warn_gb"), "paths.disk_warn_gb"
+        )
+        if warn > peak:
+            raise ConfigError(
+                f"paths.disk_warn_gb（{warn} GB）不能高于 paths.max_peak_disk_gb"
+                f"（{peak} GB）：预警线画在硬上限外面就永远不会被触发。"
             )
 
 
@@ -1127,15 +1224,30 @@ def estimate_disk_gb(config: AppConfig, capture_seconds: float) -> float:
     return frames * width * height / (1024.0**3)
 
 
+def plan_disk_gb(config: AppConfig, plans: Iterable[Any]) -> tuple[float, float, float]:
+    """返回 (总占用 GB, 单段最大占用 GB, 总时长 秒)。
+
+    单段最大值是给"边采边清"用的：RAW 处理完就删的话，盘上任何时刻只有
+    **当前这一段**，峰值不是总和。
+    """
+    plan_list = list(plans)
+    seconds = estimate_capture_seconds(config, plan_list)
+    total = estimate_disk_gb(config, seconds)
+    per_plan = [
+        estimate_disk_gb(config, estimate_capture_seconds(config, [plan]))
+        for plan in plan_list
+    ]
+    return total, (max(per_plan) if per_plan else 0.0), seconds
+
+
 def disk_estimate_lines(config: AppConfig, plans: Iterable[Any]) -> list[str]:
     """给界面/日志用的中文磁盘估算说明。"""
-    seconds = estimate_capture_seconds(config, plans)
-    size_gb = estimate_disk_gb(config, seconds)
+    total_gb, peak_gb, seconds = plan_disk_gb(config, plans)
     width, height = config.effective_camera_size()
     fps = config.effective_fps()
     lines = [
         f"预计录制总时长：约 {seconds / 60.0:.1f} 分钟（{seconds:.0f} 秒）",
-        f"预计 RAW 占用：约 {size_gb:.2f} GB"
+        f"预计 RAW 占用：约 {total_gb:.2f} GB"
         f"（{width}×{height} Mono8 @ {fps:.2f} fps）",
     ]
     if config.mode != "dry_run" and config.camera.roi is None:
@@ -1143,9 +1255,131 @@ def disk_estimate_lines(config: AppConfig, plans: Iterable[Any]) -> list[str]:
             "★ 当前没有设置 ROI 裁剪：满幅 1936×1096 在 132 fps 下约 280 MB/s，"
             "是磁盘占用的第一主导项。现场建议把 camera.roi 填成包住棋盘格的一块。"
         )
-    if not config.camera.save_raw:
-        lines.append("（当前 save_raw=False，只存统计和时间戳，不存原始帧。）")
+    if config.paths.delete_raw_after_process:
+        lines.append(
+            f"★ 分组流水线已打开（paths.delete_raw_after_process=true）："
+            f"一组动作全部走完、机械臂停稳之后，整组按步长 "
+            f"{int(config.paths.process_stride)} 逐帧识别、落盘角点并**回读校验**，"
+            f"校验通过才删除这一组的 RAW，然后才进下一组。"
+            f"所以盘上同时只有当前这一组（单段最大约 {peak_gb:.2f} GB），"
+            f"而不是整场的 {total_gb:.2f} GB。"
+            f"硬上限 {config.paths.max_peak_disk_gb:.0f} GB、"
+            f"预警线 {config.paths.disk_warn_gb:.0f} GB（见 check_group_disk）。"
+        )
+    else:
+        lines.append(
+            "（原始帧全程留盘：camera.save_raw 必须为 true，本工具不提供关闭选项。"
+            "盘不够时请改用 paths.delete_raw_after_process 分组流水线，或裁小 ROI。）"
+        )
     return lines
+
+
+# --------------------------------------------------------------------------
+# 分组流水线的磁盘估算（需求一）
+# --------------------------------------------------------------------------
+
+
+def segment_raw_gb(config: AppConfig, segment: Any) -> float:
+    """一段采集的 RAW 会占多少 GB。
+
+    ``segment`` 可以是 ``SegmentPlan``，也可以是任何有 ``steps`` 的对象
+    （``SegmentPlan.steps`` 就是"这一段包含的那一到两个计划步"）。
+    """
+    return float(estimate_disk_gb(config, estimate_capture_seconds(config, [segment])))
+
+
+def group_disk_gb(config: AppConfig, segments: Iterable[Any]) -> tuple[float, float]:
+    """一组动作的占用，返回 ``(RAW GB, 含派生文件 GB)``。
+
+    为什么一组要单独算：分组流水线下，盘上同时存在的是**当前这一组**的全部段
+    （整组采完才处理、才删），而不是单段、也不是整场。组的划分见
+    ``experiment.ExperimentSession`` 的 ``begin_group`` 调用点。
+    """
+    raw = sum(segment_raw_gb(config, segment) for segment in segments)
+    ratio = float(config.paths.derived_overhead_ratio)
+    return raw, raw * (1.0 + ratio)
+
+
+def group_peak_gb(config: AppConfig, groups: Mapping[str, Iterable[Any]]) -> tuple[float, str, dict[str, float]]:
+    """整场跑下来，盘上的峰值占用出现在哪一组。返回 ``(峰值 GB, 组名, 每组 GB)``。"""
+    per_group = {
+        str(name): group_disk_gb(config, segments)[1] for name, segments in groups.items()
+    }
+    if not per_group:
+        return 0.0, "", {}
+    name = max(per_group, key=lambda key: per_group[key])
+    return per_group[name], name, per_group
+
+
+def check_group_disk(
+    config: AppConfig, segments: Iterable[Any], *, what: str = "本组动作"
+) -> tuple[bool, list[str]]:
+    """进入下一组动作之前的磁盘闸门（需求一）。
+
+    三件事，按严重程度从小到大：
+
+    1. **估算**：这一组的 RAW + 派生数据一共多少 GB。
+    2. **预警**：超过 ``paths.disk_warn_gb``（默认 40 GB）就放行但明确预警——
+       让操作者有机会先清盘，而不是等下一组被硬拦。
+    3. **硬拦**：超过 ``paths.max_peak_disk_gb``（默认 50 GB）**或**可用空间不够，
+       直接拒绝开始这一组。这一条是"不得开始下一组"的落地处。
+
+    为什么用"这一组"而不是"这一段"：一组是流水线上"同时驻留"的单位，
+    整组采完才处理，所以峰值就是这一组的总和。单段算会低估几十倍。
+
+    ★ **硬上限只在分组流水线打开时才算。** ``max_peak_disk_gb`` 说的是
+    "任意时刻盘上的 RAW + 临时文件"——只有"处理完就删"时才等于"当前这一组"。
+    开关关着的时候 RAW 是**全程累积**的，拿 50 GB 去卡每一组会让默认配置
+    根本跑不起来（整场就是 200～350 GB 的量级），那不是在保护数据，
+    是在逼人关掉检查。所以那种情况下这里只查"这一组要写的量 + 绝对下限"
+    够不够，并把估算如实报出来。
+    """
+    segment_list = list(segments)
+    raw_gb, total_gb = group_disk_gb(config, segment_list)
+    rolling = bool(config.paths.delete_raw_after_process)
+    peak = float(config.paths.max_peak_disk_gb)
+    warn = float(config.paths.disk_warn_gb)
+    headroom = float(config.paths.process_headroom)
+    need_gb = max(float(config.paths.min_free_disk_gb), total_gb * headroom)
+    lines = [
+        f"{what}：{len(segment_list)} 段，RAW 约 {raw_gb:.2f} GB，"
+        f"含派生文件约 {total_gb:.2f} GB（派生按 RAW 的 "
+        f"{float(config.paths.derived_overhead_ratio):.0%} 计）",
+    ]
+    if rolling:
+        lines.append(f"硬上限 {peak:.0f} GB / 预警线 {warn:.0f} GB")
+    else:
+        lines.append(
+            "（分组流水线未打开：RAW 全程累积，整场总和才是峰值，"
+            "因此不拿单组硬上限来卡；本组估算仅供参考。）"
+        )
+    lines.append(
+        f"按计划需要约 {need_gb:.2f} GB（含 {int((headroom - 1) * 100)}% 余量）"
+    )
+    if rolling and total_gb > peak:
+        lines.append(
+            f"磁盘检查未通过：本组估算 {total_gb:.2f} GB 超过硬上限 {peak:.0f} GB，"
+            "**不得开始这一组**。可做的三件事：把 camera.roi 裁到刚好包住棋盘格；"
+            "把这一组再拆小（例如减少 formal.staircase_n 或 repeats）；"
+            "或换一个更大的输出盘。"
+        )
+        return False, lines
+    ok, message = check_free_disk(config.resolve_output_root(), need_gb)
+    if ok and rolling and total_gb > warn:
+        lines.append(
+            f"★ 磁盘预警：本组估算 {total_gb:.2f} GB 已超过预警线 {warn:.0f} GB"
+            f"（硬上限 {peak:.0f} GB）。本次放行，但建议先清盘或裁小 ROI，"
+            "否则再大一点就会被硬拦。"
+        )
+    if ok:
+        lines.append(f"磁盘检查：{message}")
+    else:
+        lines.append(
+            f"磁盘检查未通过：{message}"
+            "可做的三件事：把 camera.roi 裁到刚好包住棋盘格；"
+            "把这一组再拆小；或换一个更大的输出盘。"
+        )
+    return bool(ok), lines
 
 
 def check_plan_disk(
@@ -1164,23 +1398,27 @@ def check_plan_disk(
     所以这里按计划算"接下来这一段要多少"，乘一个余量（默认 15%），
     再和"绝对下限"取较大者。不够就返回 False，由调用方**拒绝开始**这一段。
     """
-    lines = disk_estimate_lines(config, plans)
-    seconds = estimate_capture_seconds(config, plans)
-    size_gb = estimate_disk_gb(config, seconds)
+    plan_list = list(plans)
+    lines = disk_estimate_lines(config, plan_list)
+    total_gb, peak_gb, _seconds = plan_disk_gb(config, plan_list)
+    # 边采边清时，盘上只要放得下"最大的那一段"，因为上一段在处理完就被删了；
+    # 但**不能**因此把门槛降到 0——正在录的那一段仍然要一次写完。
+    size_gb = peak_gb if config.paths.delete_raw_after_process else total_gb
+    what = "最大的一段" if config.paths.delete_raw_after_process else "本段计划"
     need_gb = max(float(config.paths.min_free_disk_gb), size_gb * float(headroom))
     ok, message = check_free_disk(config.resolve_output_root(), need_gb)
     if ok:
         lines.append(
-            f"磁盘检查：{message}（本段按计划需要约 {need_gb:.2f} GB，"
+            f"磁盘检查：{message}（{what}按计划需要约 {need_gb:.2f} GB，"
             f"含 {int((headroom - 1) * 100)}% 余量）"
         )
     else:
         lines.append(
             f"磁盘检查未通过：{message}"
-            f"本段按计划需要约 {need_gb:.2f} GB。"
+            f"{what}按计划需要约 {need_gb:.2f} GB。"
             "可做的三件事：把 camera.roi 裁到刚好包住棋盘格；"
-            "或把 camera.save_raw 关掉（只留时间戳与统计）；"
-            "或换一个更大的输出盘。"
+            "或打开 paths.delete_raw_after_process（边采边清：每段处理完就删 RAW，"
+            "盘上只留当前这一段）；或换一个更大的输出盘。"
         )
     return ok, lines
 

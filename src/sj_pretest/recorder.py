@@ -391,3 +391,22 @@ def append_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(text.rstrip() + "\n")
+
+
+def remove_raw_artifacts(raw_path: Path) -> list[Path]:
+    """删掉一段采集的原始帧文件（含写盘中断留下的 .tmp）。
+
+    ★ 只删 RAW 本身。同目录下的 frame_timestamps.csv、missing_frames.csv、
+    capture_summary.txt、capture_metadata.json、样本图**一律保留**——
+    它们是"这一段当时是怎么采的"的证据，体积很小，删了就没法复核采集过程了。
+
+    调用方必须**先**确认派生数据已经落盘并回读校验过（见
+    ``experiment.ExperimentSession.process_and_release``）：这个函数只负责删，
+    它不会、也无法判断删掉之后还算不算得出来。
+    """
+    removed: list[Path] = []
+    for path in (Path(raw_path), Path(str(raw_path) + ".tmp")):
+        if path.is_file():
+            path.unlink()
+            removed.append(path)
+    return removed

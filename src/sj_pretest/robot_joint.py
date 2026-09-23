@@ -42,6 +42,18 @@ class MotionAborted(RobotError):
     """用户中止（或急停/掉线）导致的取消。区别于普通错误：它不该被当成失败重试。"""
 
 
+class SettleTimeout(RobotError):
+    """等待停稳超时：到时间了关节还在动。
+
+    和 :class:`MotionAborted` 分开，因为原因不同、人的处置也不同：
+    中止是"人叫停的"，超时是"机器没停住"。但两者的后果一样硬：
+    **已经发的这一条要就地 stopJ，后面的动作一律不发，也不自动回位**，
+    盘上已经写下的 RAW / RTDE / 时间戳全部保留，等人来看现场。
+    （原来这里只写一行日志就继续往下走 hold → return → 下一条运动，
+    那等于"没停稳也照样往下做"，采到的数据会带着残余运动被当成到位值。）
+    """
+
+
 @dataclass
 class RobotState:
     """一条机器人状态记录。字段对应需求六要求的原始数据项 5～9。"""
@@ -182,6 +194,12 @@ class HardwareJointRobot:
     mode: str = "hardware"
     synthetic: bool = False
     settle_poll_s: float = 0.05
+    #: 底层连接对象的工厂。默认 None = ``vendor.robot.URRobot()``（真机路径）。
+    #: ★ 存在的唯一理由是**可测**：本类的单位换算（度 ↔ 弧度）和拒发逻辑是红线，
+    #: 必须在没有真机、甚至没有装 ur_rtde 的机器上也能验证，
+    #: 所以留一个"塞一个假控制器进来"的缝（见 tests/test_hardware_units.py）。
+    #: 生产路径不会传它。
+    robot_factory: Callable[[], Any] | None = None
 
     def __post_init__(self) -> None:
         self._robot: Any = None
@@ -196,7 +214,11 @@ class HardwareJointRobot:
 
     def connect(self, *, require_control: bool) -> None:
         robot_module = vendor_module("robot")
-        self._robot = robot_module.URRobot()
+        if self.robot_factory is not None:
+            # 自测用的假控制器：它的接口和 ``URRobot`` 一样，但不连任何真机。
+            self._robot = self.robot_factory()
+        else:
+            self._robot = robot_module.URRobot()
         # 连接、Dashboard 只读、RTDE 建链与重试全部沿用被复用代码里跑通过的那套。
         self._robot.connect(require_control=require_control)
         state = self._robot.read_state()
@@ -308,6 +330,15 @@ class HardwareJointRobot:
         if not ok:
             raise RobotError(f"目标姿态未通过本地限位检查：{reason}")
 
+        # ★ 单位边界：本类内部、界面、日志、以及"停稳"判据**全部用度**，
+        # 而 ur_rtde 的关节接口是 **SI 单位（弧度）**——``isJointsWithinSafetyLimits``
+        # 和 ``moveJ`` 收到的必须是 rad。这一层换算只做一次，就在这里：
+        # 把六个度值转成弧度后交给 RTDE，之后本类再也不用 rad。
+        # （原来这里直接把度值传了下去：真机上等于把 0.2° 当成 0.2 rad
+        #  ——安全限位检查会拿一个比真实值小 57 倍的角度去判，
+        #  moveJ 更会让关节转过 11.5° 而不是 0.2°，必须在此拦住。）
+        target_rad = [math.radians(value) for value in target]
+
         # 第二层：让 UR 控制器自己判断（和 moveL 路径一样的思路）。
         checker = getattr(self._robot.control, "isJointsWithinSafetyLimits", None)
         if checker is None:
@@ -315,7 +346,7 @@ class HardwareJointRobot:
                 "当前 ur_rtde 版本没有 isJointsWithinSafetyLimits；"
                 "为了安全，程序不允许跳过该检查后运动。"
             )
-        if not bool(checker(list(target))):
+        if not bool(checker(list(target_rad))):
             raise RobotError(
                 f"{label}：UR 控制器判定该关节姿态超出当前安全限制，已拒绝发送。"
             )
@@ -340,18 +371,22 @@ class HardwareJointRobot:
 
         speed_rad = math.radians(float(speed_deg_s))
         accel_rad = math.radians(float(accel_deg_s2))
+        # 日志继续按现场习惯显示度数，同时把真正发出去的弧度也打出来：
+        # 万一单位又出问题，日志里能一眼对上。
         print(
             f"[机器人] moveJ → {label}\n"
             f"         目标(度)：{['%.4f' % v for v in target]}\n"
+            f"         目标(弧度，实际下发)：{['%.6f' % v for v in target_rad]}\n"
             f"         速度 {speed_deg_s} °/s（{speed_rad:.6f} rad/s），"
             f"加速度 {accel_deg_s2} °/s²（{accel_rad:.6f} rad/s²）",
             flush=True,
         )
         accepted = bool(
-            self._robot.control.moveJ(list(target), speed_rad, accel_rad, True)
+            self._robot.control.moveJ(list(target_rad), speed_rad, accel_rad, True)
         )
         if not accepted:
             raise RobotError(f"{label}：UR 控制器拒绝了异步 moveJ。")
+        # 记住的是**度**：界面、日志和"停稳"判据都拿它跟实际角（度）比。
         self._last_command = target
         self._moved_event_ids.append(event_id)
 
