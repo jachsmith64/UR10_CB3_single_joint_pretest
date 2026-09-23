@@ -280,7 +280,16 @@ class StaticNoise:
     span_x_px: float
     span_y_px: float
     span_rotation_deg: float
+    #: ★ **静态基线实际录了多久**（采集口径）。报告里"基线多少秒"说的就是它。
+    #: 早先这里装的其实是"离线处理算了多久"，于是同一段 3 s 的静止采集
+    #: 会因为算力不同被写成 14.5 s——单位没错、量纲没错，但量错了东西，
+    #: 而且写进报告时没人看得出来。
     seconds: float
+    #: 这一段 RAW 里**一共**多少帧（采集帧数）。stride > 1 时大于 ``frames``，
+    #: 报告要把两个数都写出来，"统计了多少帧"和"录了多少帧"是两回事。
+    captured_frames: int = 0
+    #: 离线处理这段花掉的 wall clock 秒数。**不是实验量**，仅供现场估时间。
+    process_seconds: float = 0.0
 
     def noise_along_px(self, direction_deg: float) -> float:
         """把二维噪声投到某个图像方向上。
@@ -299,7 +308,11 @@ class StaticNoise:
             "segment_id": self.segment_id,
             "frames": int(self.frames),
             "valid_ratio": float(self.valid_ratio),
+            # seconds = 这一段**录了多久**（采集口径）；process_seconds = 处理耗时。
+            # 两个都写出来，"基线时长"和"算力开销"以后不会再有第二种读法。
             "seconds": float(self.seconds),
+            "captured_frames": int(self.captured_frames),
+            "process_seconds": float(self.process_seconds),
             "std_x_px": float(self.std_x_px),
             "std_y_px": float(self.std_y_px),
             "std_radial_px": float(self.std_radial_px),
@@ -313,11 +326,20 @@ class StaticNoise:
         }
 
     def summary_lines(self) -> list[str]:
+        # 采集帧数 / 统计帧数 / 采集时长 三件事分开说：stride > 1 时
+        # "录了 397 帧、统计了 50 帧"和"录了 50 帧"是完全不同的实验。
+        recorded = (
+            f"{self.captured_frames} 帧 / {self.seconds:.2f} s"
+            if self.captured_frames
+            else f"{self.frames} 帧 / {self.seconds:.2f} s"
+        )
+        stats = (
+            f"参与统计 {self.frames} 帧"
+            + ("" if self.captured_frames in (0, self.frames) else "（按处理步长抽样）")
+            + f"，有效角点帧 {self.valid_ratio:.1%}"
+        )
         return [
-            (
-                f"静态基线 {self.segment_id}：{self.frames} 帧 / {self.seconds:.2f} s，"
-                f"有效角点帧 {self.valid_ratio:.1%}"
-            ),
+            f"静态基线 {self.segment_id}：本段录了 {recorded}；{stats}",
             (
                 f"  质心噪声 σx={self.std_x_px:.4f} px，σy={self.std_y_px:.4f} px，"
                 f"径向 {self.std_radial_px:.4f} px"
@@ -379,8 +401,24 @@ def analyze_static(segment: SegmentVision) -> StaticNoise:
         span_rotation_deg=(
             float(np.max(angles) - np.min(angles)) if angles.size else 0.0
         ),
-        seconds=float(segment.seconds),
+        # ★ 报告里的"基线多少秒"必须是**采集时长**，不是这段离线算了多久。
+        # 采集时长取不到（老段目录没写 content_seconds）时，退回用本段分析时间轴
+        # 的实际跨度——那也是采集侧的时间，量纲和物理含义都对；
+        # 绝不退回 ``segment.seconds``（那是 wall clock，换台机器就变）。
+        seconds=_captured_seconds(segment),
+        captured_frames=int(segment.captured_frames),
+        process_seconds=float(segment.seconds),
     )
+
+
+def _captured_seconds(segment: "SegmentVision") -> float:
+    """这一段 RAW 实际录了多久（优先采集层写的 ``content_seconds``）。"""
+    if segment.captured_seconds > 0:
+        return float(segment.captured_seconds)
+    times = segment.times()
+    if times.size >= 2:
+        return float(times[-1] - times[0])
+    return 0.0
 
 
 # --------------------------------------------------------------------------
@@ -639,6 +677,8 @@ def _fill_depth_layer(
         # 棋盘格可能偏心装，只看质心平移会把它的面内运动量小看甚至量成 0，
         # 那样深度/面内比值就会被抬高，一次纯转动可能被误判成"轴向偏大"。
         rotation_joint=str(metrics.joint) in set(config.vision.rotation_joints),
+        # ★ 基准是几帧的平均进了可分辨下限的公式，复算时必须原样带过来。
+        reference_frames=int(getattr(segment, "reference_frames", 1) or 1),
     )
     metrics.depth_mm = estimate.depth_mm
     metrics.in_plane_mm = estimate.in_plane_mm
@@ -728,6 +768,7 @@ def check_segment_analyzable(
         config=config,
         noise_frames=noise,
         rotation_joint=str(joint) in set(config.vision.rotation_joints),
+        reference_frames=int(getattr(segment, "reference_frames", 1) or 1),
     )
     if estimate.confidence == "unavailable":
         return False, f"轴向/面内分解算不出来：{estimate.note}"

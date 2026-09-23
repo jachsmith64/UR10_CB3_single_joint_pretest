@@ -42,12 +42,18 @@
     "post_motion_s": 0.3,
     "pre_motion_s": 0.3,
     "hold_s": 1.5,
-    "roi": null,
+    "analysis_roi": null,
     "save_raw": true,
     "save_sample_images": true,
     "sample_image_count": 5,
     "min_margin_px": 40,
-    "max_dropped_ratio": 0.02
+    "max_dropped_ratio": 0.02,
+    "sensor_width": 1936,
+    "sensor_height": 1096,
+    "connection_check_s": 5.0,
+    "min_fps_ratio": 0.95,
+    "min_write_headroom": 1.2,
+    "resume_drain_frames": 5
   },
   "pretest": {
     "amplitudes_deg": [
@@ -120,7 +126,7 @@
   "paths": {
     "output_root": "outputs",
     "min_free_disk_gb": 2.0,
-    "delete_raw_after_process": false,
+    "delete_raw_after_process": true,
     "process_stride": 1,
     "process_headroom": 1.15,
     "derived_overhead_ratio": 0.05,

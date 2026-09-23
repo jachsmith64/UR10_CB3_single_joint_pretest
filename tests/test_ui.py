@@ -343,7 +343,11 @@ def test_parameter_dialog_shows_every_parameter_and_applies(
         assert dialog.entries, "参数面板一个输入框都没建出来"
         assert "robot.ip" in dialog.entries
         assert "thresholds.min_window_frames" in dialog.entries
-        assert "camera.roi" in dialog.entries
+        # ★ v1.0.3：面板上的 ROI 是 camera.analysis_roi（离线分析用）。
+        # 旧名 camera.roi 只作为老配置文件的兼容口，不在面板里——
+        # 面板上留一个叫 roi 的框，现场会以为它能裁 RAW 尺寸。
+        assert "camera.analysis_roi" in dialog.entries
+        assert "camera.roi" not in dialog.entries
         # 面板里的每一格都必须是配置里真有的字段——少一个就是现场改不了。
         assert set(dialog.entries) == {
             path for _section, path, _kind in __import__(

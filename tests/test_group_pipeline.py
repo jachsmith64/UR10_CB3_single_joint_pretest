@@ -16,9 +16,13 @@
 1. **组的划分**就是上面那几条（看事件流里的 ``group_started``）；
 2. **处理发生在整组采完之后**——事件顺序必须是"组内全部 ``segment_captured``
    → ``group_processing`` → ``raw_deleted``"，不许中间插队；
-3. **峰值落在预警线以内**：按交付默认参数（800×600 ROI 与 950×800 ROI）
-   算出每一组的估算峰值，都要 ≤ 预警线，而全幅 1936×1096 要被硬拦；
-4. **超估算就不得开始下一组**：闸门拒绝时**一个运动命令都不能发出去**。
+3. **峰值落在预警线以内**：按交付默认参数（全屏 1936×1096 @ 132.23 fps、
+   正式实验 Δ=0.2°）算出每一遍 repeat 的估算峰值，都要 ≤ 预警线；
+   ★ v1.0.3 起磁盘估算**一律按全屏 RAW 算**，``camera.analysis_roi``
+   再怎么改都**不得**改变估算值；
+4. **超估算就不得开始下一组**：闸门拒绝时**一个运动命令都不能发出去**；
+   单遍 repeat 自己就超硬上限时，只在"已回到名义姿态"的边界上再拆，
+   拆不动（组 A）就拒绝开始——见 ``test_formal_repeat_grouping.py``。
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import pytest
 from sj_pretest.config import (
     AppConfig,
     check_group_disk,
+    group_forecast,
     group_peak_gb,
 )
 from sj_pretest.experiment import ExperimentError
@@ -264,72 +269,134 @@ def _group_plan_map(config: AppConfig) -> dict[str, list]:
     return groups
 
 
-@pytest.mark.parametrize(
-    "roi, expected_max_gb",
-    [((0, 0, 800, 600), 22.6), ((0, 0, 950, 800), 35.8)],
-)
-def test_the_delivered_rois_stay_under_the_warning_line(
-    roi: tuple[int, int, int, int], expected_max_gb: float
-) -> None:
-    """800×600 与 950×800 两种 ROI 下，**每一组**的估算峰值都要在预警线以内。
+def _formal_group_plans(config: AppConfig, group: str, joint: str) -> list:
+    """按需求一·4 把"这一关节的组 A / 组 B"切成本次真正要跑的组。"""
+    from sj_pretest.experiment import iter_segment_plans, plan_formal_groups
+    from sj_pretest.joint_space import build_formal_group_a, build_formal_group_b
 
-    数字是 1.0.2 定稿时按**真机口径**（``mode="hardware"``、132.23 fps、
-    正式实验 Δ=0.2°、阶梯 5 级、重复 3 遍）算出来的实测值：
-    800×600 最坏一组约 22.4 GB，950×800 约 35.5 GB，两档都在 40 GB 预警线以内。
-    这里写成"实测值 + 一点余量"的上限，同时**必须**低于 ``disk_warn_gb``——
-    否则交付的默认参数自己就会一路报警，报警变成噪声就没人看了。
+    builder = build_formal_group_a if group.upper() == "A" else build_formal_group_b
+    nominal = config.robot.nominal_joint_deg
+    step = float(config.formal.step_deg[joint])
+    plans = iter_segment_plans(builder(config, nominal, joint, step))
+    return plan_formal_groups(config, plans, nominal, group, joint)
+
+
+def test_the_delivered_group_peaks_stay_under_the_warning_line() -> None:
+    """交付默认参数下，每一个正式实验组的估算峰值都要在预警线以内。
+
+    ★ v1.0.3 的组边界是**每一遍 repeat 一组**，尺寸口径是**全屏 RAW**
+    （1936×1096 @ 132.23 fps、每帧 2 122 336 字节、约 280 MB/s），
+    而且比的是 40/50 GB 两条线真正卡的**那个**数：同时驻留峰值
+    （RAW + 派生 + 处理期临时余量，见 ``GroupForecast.peak_gb``——
+    需求二的原话是"同时驻留的 RAW + 临时文件 + 本组派生文件估算值 ≤ 50 GB"）。
+    按真机口径（``mode="hardware"``、Δ=0.2°、阶梯 5 级、重复 3 遍）算出来：
+    组 A 一遍约 19.3 GB、组 B 一遍约 38.5 GB，六个关节都一样
+    （帧数只由时长决定，跟哪个关节无关）。
+
+    ★ 组 B 一遍 38.49 GB 距 40 GB 预警线只剩 1.51 GB。这不是余量不够，
+    是"交付举例用的那个 Δ=0.2° 本来就在预警线附近"：Δ 更大时组 B 会被预警，
+    再大就会被硬拦并自动在"回到名义姿态"的地方（正负循环之间）再拆。
+    现场要跑更大的 Δ，就先清盘或换一个更大的盘。
 
     注意 ``mode`` 必须是 hardware：干运行把画面缩到 340×260，算出来的占用
     和现场不是一个量级，拿它验"现场放不放得下"没有意义。
     """
     config = AppConfig()
     config.mode = "hardware"
-    config.camera.roi = list(roi)
     config.formal.step_deg = {joint: 0.2 for joint in config.pretest.joints}
     config.validate()
-
-    peak_gb, worst, per_group = group_peak_gb(config, _group_plan_map(config))
-    assert per_group, "一组都没算出来"
-    assert peak_gb <= expected_max_gb, (
-        f"{roi[2]}×{roi[3]}：最坏一组是「{worst}」{peak_gb:.2f} GB，"
-        f"超过定稿实测上限 {expected_max_gb} GB"
+    # 交付参数下**不需要**再拆细一级：按遍分就已经放得下。
+    # 这一条要是失败，说明默认参数已经大到要现场多停好几次了。
+    assert config.camera.analysis_roi is None, (
+        "交付默认不该带分析 ROI：ROI 只影响分析速度，不影响 RAW 尺寸"
     )
-    assert peak_gb <= float(config.paths.disk_warn_gb), (
-        f"{roi[2]}×{roi[3]}：最坏一组 {peak_gb:.2f} GB 已经越过预警线 "
-        f"{config.paths.disk_warn_gb:.0f} GB——交付默认参数会一路报警"
+    cap_gb = float(config.paths.max_peak_disk_gb)
+    warn_gb = float(config.paths.disk_warn_gb)
+
+    per_group: dict[str, float] = {}
+    for joint in config.pretest.joints:
+        for group in ("A", "B"):
+            plans = _formal_group_plans(config, group, joint)
+            for item in plans:
+                assert item.level == "repeat", (
+                    f"交付参数下 {item.name} 竟然要拆到「{item.level}」这一级："
+                    "默认参数不该离硬上限这么近"
+                )
+                forecast = group_forecast(config, item.segments)
+                per_group[item.name] = forecast.peak_gb
+                # ★ 界面上"是否低于 40/50 GB"那两行，必须与闸门真正据以放行的
+                # 判据**同源**（都是 peak_gb）。显示一个数、执行另一个数的话，
+                # 现场看到的"是"就不是程序实际用的那个结论。
+                assert forecast.under_cap == (forecast.peak_gb <= cap_gb), item.name
+                assert forecast.under_warn == (forecast.peak_gb <= warn_gb), item.name
+                assert forecast.resident_gb < forecast.peak_gb, (
+                    "驻留量与同时驻留峰值应当差着处理期那部分余量，"
+                    "两个数相等说明 process_headroom 没起作用"
+                )
+
+    assert per_group, "一个正式实验组都没算出来"
+    worst = max(per_group, key=lambda name: per_group[name])
+    limits = {"A": 19.5, "B": 39.5}
+    for name, peak_gb in sorted(per_group.items()):
+        limit = limits["A"] if "组A " in name else limits["B"]
+        assert peak_gb <= limit, (
+            f"「{name}」估算峰值 {peak_gb:.2f} GB，超过 v1.0.3 定稿实测上限 {limit} GB"
+        )
+        assert peak_gb <= warn_gb, (
+            f"「{name}」估算峰值 {peak_gb:.2f} GB 越过预警线 "
+            f"{warn_gb:.0f} GB——交付默认参数会一路报警"
+        )
+        assert peak_gb <= cap_gb
+    assert "组B" in worst, f"最坏一组竟然是「{worst}」——组 B 才是最大的那一组"
+    assert per_group[worst] == pytest.approx(38.49, abs=0.5), (
+        f"最坏一组「{worst}」估算 {per_group[worst]:.2f} GB，与定稿的 38.49 GB "
+        "差得太多——估算口径（全屏尺寸/帧率/时长模型/处理余量）被改动过？"
     )
-    assert peak_gb <= float(config.paths.max_peak_disk_gb)
-
-
-def test_full_frame_is_refused_by_the_hard_cap() -> None:
-    """不裁 ROI 的全幅画面（1936×1096）必须被硬上限拦下来。
-
-    这一条是"分组流水线真的在按峰值把关"的反向证据：同一套代码、
-    同一套计划，只是画面从 950×800 变成满幅，就必须从"放行"变成"拒绝开始"。
-    满幅一组约 99 GB（整场约 1 TB），正是需求一说的"不得开始下一组"。
-
-    硬上限只在分组流水线打开时才算（开关关着的时候 RAW 是全程累积的，
-    拿 50 GB 卡每一组等于禁用默认配置，见 ``check_group_disk`` 的说明），
-    所以这里把开关打开——这也正是现场要控峰值时的用法。
-    顺便：这条断言因此**不依赖跑测试那台机器的剩余磁盘**，
-    超硬上限是先判的，轮不到"可用空间够不够"。
-    """
-    config = AppConfig()
-    config.mode = "hardware"
-    config.camera.roi = [0, 0, 1936, 1096]
-    config.paths.delete_raw_after_process = True
-    config.formal.step_deg = {joint: 0.2 for joint in config.pretest.joints}
-    config.validate()
-    ok, lines = check_group_disk(
-        config, _group_plan_map(config)["组A J1"], what="组A J1 正式实验"
+    assert warn_gb - per_group[worst] >= 1.0, (
+        f"最坏一组「{worst}」距预警线只剩 {warn_gb - per_group[worst]:.2f} GB："
+        "交付举例用的 Δ 不该贴着预警线"
     )
-    assert ok is False, "全幅画面居然被放行了：\n" + "\n".join(lines)
-    assert "不得开始这一组" in "\n".join(lines)
     assert float(config.paths.max_peak_disk_gb) == 50.0, (
         "硬上限被改过了——需求一写的是 50 GB"
     )
     assert 35.0 <= float(config.paths.disk_warn_gb) <= 40.0, (
         "预警线要落在需求一建议的 35～40 GB 区间里"
+    )
+
+
+def test_the_analysis_roi_never_changes_the_disk_estimate() -> None:
+    """★ 需求一·2：磁盘估算**一律按全屏 RAW 算**，分析 ROI 怎么改都不许动它。
+
+    这一条是"RAW 全屏、ROI 只用于离线分析"在**估算口径**上的体现，
+    也正好是 v1.0.2 的错处：那时候按 ROI 裁着存，估算也跟着 ROI 缩，
+    于是"盘够不够"这个判断是拿一个被缩小的画面做的——现场的真实画面大 4～5 倍，
+    等发现放不下的时候，RAW 已经写下去一半了。
+
+    反面写法（"改了 ROI 估算就变小"）在这里被明确断言为**假**。
+    """
+    config = AppConfig()
+    config.mode = "hardware"
+    config.formal.step_deg = {joint: 0.2 for joint in config.pretest.joints}
+    config.validate()
+    baseline = group_peak_gb(config, _group_plan_map(config))[0]
+
+    for roi in ([0, 0, 800, 600], [0, 0, 950, 800], [0, 0, 1936, 1096]):
+        config.camera.analysis_roi = list(roi)
+        config.validate()
+        again, _worst, _per = group_peak_gb(config, _group_plan_map(config))
+        assert abs(again - baseline) < 1e-9, (
+            f"把 analysis_roi 改成 {roi} 之后磁盘估算从 {baseline:.4f} GB "
+            f"变成了 {again:.4f} GB——估算跟着分析窗口缩了，"
+            "而现场真实要写的是全屏 RAW，这会把磁盘闸门架在一次误判上"
+        )
+
+    # 旧字段 camera.roi 也只是 analysis_roi 的兼容写法，同样不许影响估算。
+    config.camera.analysis_roi = None
+    config.camera.roi = [0, 0, 800, 600]
+    config.validate()
+    legacy, _worst, _per = group_peak_gb(config, _group_plan_map(config))
+    assert abs(legacy - baseline) < 1e-9, (
+        "旧字段 camera.roi 又把磁盘估算拉小了：v1.0.2 的裁剪行为被带回来了"
     )
 
 
@@ -363,6 +430,8 @@ def test_the_group_gate_reports_the_group_not_the_whole_run(tmp_path: Path) -> N
 
     整场 200～350 GB、单组 20～34 GB，把总和报给闸门就等于永远不放行。
     """
+    from sj_pretest.experiment import capture_segment_count
+
     config = build_config(
         tmp_path,
         joints=("J1", "J6"),
@@ -380,4 +449,16 @@ def test_the_group_gate_reports_the_group_not_the_whole_run(tmp_path: Path) -> N
     )
     ok, lines = check_group_disk(config, groups[worst], what=worst)
     text = "\n".join(lines)
-    assert f"{len(groups[worst])} 段" in text, text
+
+    # ★ 报的是**真正会采的那几段**，不是计划里所有条目（需求一·5：纯等待步骤
+    # 只要不写 RAW，就不算进录制时间）。组 B 的一组里有一步是"停下来等稳定"，
+    # 它不写 RAW，所以"动作数量"要比 plan 条目少一个。
+    captures = capture_segment_count(groups[worst])
+    assert 0 < captures < len(groups[worst]), (
+        f"这一组有 {len(groups[worst])} 个计划条目、{captures} 段会采——"
+        "这条断言本来就要求两者不等，好证明等待步骤被排除了"
+    )
+    assert f"动作数量：{captures} 段采集" in text, text
+    assert f"{len(groups[worst])} 段采集" not in text, (
+        "把不写 RAW 的等待步骤也算成了动作"
+    )

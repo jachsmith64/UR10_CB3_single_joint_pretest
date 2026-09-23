@@ -84,13 +84,35 @@ def test_the_gate_blocks_when_the_threshold_is_tightened(tmp_path: Path) -> None
 
 
 def test_the_gate_is_monotone_in_the_threshold(tmp_path: Path) -> None:
-    """判据要跟着阈值单调走：松的过、紧的不过，中间不许出现"紧了反而过"。"""
-    loose, failed_loose, _ = _quick_probe(tmp_path / "loose", max_depth_ratio=2.0)
-    tight, failed_tight, _ = _quick_probe(tmp_path / "tight", max_depth_ratio=0.05)
-    assert failed_tight and not failed_loose, (
-        f"阈值 2.0 时 {failed_loose}，阈值 0.05 时 {failed_tight}：判据方向反了\n"
-        f"{loose}\n{tight}"
+    """判据要跟着阈值单调走：松的过、紧的不过，一个极端都不许反。
+
+    ★ v1.0.3：改成拿一个**已知比值**的估计扫一遍阈值，而不是拿干运行的真实
+    数字去撞 0.05 与 2.0 这两个点。旧写法隐含"真实比值正好落在两个阈值之间"
+    这个巧合（v1.0.2 时恰好成立），识别口径一变就会退化成"数字巧合测试"，
+    而它本来要证明的是**单调性**。真实数据那一边由上面两条覆盖：
+    交付默认必须放行、收到 0.001 必须拦下。
+    """
+    estimate = _estimate(
+        tmp_path, working_distance_mm=675.0, scale=1.001, shift_x_px=8.0
     )
+    ratio = float(estimate.ratio_upper)
+    assert estimate.ratio_upper is not None and 0.0 < ratio < 1.0, ratio
+    thresholds = [0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 2.0]
+    flags = [
+        judge_in_plane_dominant(estimate, max_depth_ratio=float(t))[0]
+        for t in thresholds
+    ]
+    assert flags == sorted(flags), (
+        f"判据不单调——松了反而不过：{list(zip(thresholds, flags))}"
+    )
+    assert True in flags and False in flags, (
+        f"这组阈值没有把放行/拦下分开（比值 {ratio}）：{list(zip(thresholds, flags))}"
+    )
+    for threshold, flag in zip(thresholds, flags):
+        assert flag is (ratio <= threshold), (
+            f"阈值 {threshold} 时判成 {flag}，而比值是 {ratio}——"
+            "判据不是「比值 ≤ 阈值」这一个式子，而是别的东西"
+        )
 
 
 def _frame(scale: float, shift_x_px: float, shift_y_px: float):
@@ -125,12 +147,22 @@ def _estimate(
     shift_x_px: float,
     shift_y_px: float = 0.0,
 ) -> DepthInPlane:
-    """静止段噪声固定（±3e-5 量级，和合成世界实测同量级），运动段给一组 (scale, shift)。"""
+    """静止段噪声固定（±3e-5 量级，和合成世界实测同量级），运动段给一组 (scale, shift)。
+
+    ★ 运动窗口里的帧**全部**在同一个位姿上（这就是"保持段"的定义）。
+    以前这里放了一帧名义位姿 + 一帧运动到位：那是把**参考帧**混进了窗口。
+    真实的窗口（``analysis`` / 快速几何检查）取的都是保持段，里面一帧名义位姿
+    都没有——深度取的是窗口**均值**，混进一帧名义位姿会把均值拉走一半，
+    量出来的深度就偏小一半，而这个偏差跟被测量的运动毫无关系。
+    """
     config = build_config(tmp_path, joints=("J1",), amplitudes=(0.2,), repeats=1)
     config.camera.working_distance_mm = float(working_distance_mm)
     config.validate()
     noise = [_frame(1.0 + delta, 0.0, 0.0) for delta in (-3e-5, 0.0, 3e-5, -1e-5, 2e-5)]
-    signal = [_frame(1.0, 0.0, 0.0), _frame(scale, shift_x_px, shift_y_px)]
+    signal = [
+        _frame(scale, shift_x_px, shift_y_px),
+        _frame(scale, shift_x_px, shift_y_px),
+    ]
     return estimate_depth_in_plane(signal, config=config, noise_frames=noise)
 
 

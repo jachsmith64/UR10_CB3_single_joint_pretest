@@ -103,16 +103,38 @@ def test_full_dry_run_flow_end_to_end(tmp_path: Path, small_config) -> None:
     probe_result, failed = session.run_quick_probes()
     assert probe_result.segments, "快速几何检查一段都没采"
     assert [line for line in probe_result.lines if "快速几何检查" in line]
-    # 合成棋盘格是 16 px/格（半径约 90 px）：J6 转 0.05° 只让角点沿切向挪
-    # 约 0.08 px，和合成世界的角点噪声同一个量级——所以 J6 这一档
-    # **在合成世界里本来就看不出来**（真机上棋盘格在画面里大得多，是另一回事）。
-    # 这正是需求三.B 要拦的那种情况：工具必须停下来把话说清楚，而不是自己往下走。
-    # 所以这里断言的不是"全都通过"，而是"该拦的拦住了、话说清楚了、
-    # 而且**没有**替人做决定继续跑"。
-    assert failed == ["J6"], f"合成世界里应当只有 J6 的 0.05° 探针看不出来，实际 {failed}"
-    assert probe_result.aborted is True, "快速几何检查没过却标成正常结束"
-    assert "看不出来" in "\n".join(probe_result.lines), "没有说明是哪一条判据没过"
-    assert "暂停" in "\n".join(probe_result.lines)
+    # 给人看的那一行结论，必须和程序真正据以暂停的那份名单**一致**
+    # （同一个来源，不能各说各话）。
+    verdict = {}
+    for line in probe_result.lines:
+        text_line = line.strip()
+        for joint in ("J1", "J6"):
+            prefix = f"{joint} 快速几何检查："
+            if text_line.startswith(prefix):
+                verdict[joint] = text_line[len(prefix) :].strip()
+    assert set(verdict) == {"J1", "J6"}, f"逐关节结论行不全：{verdict}"
+    assert {name for name, value in verdict.items() if value == "未通过"} == set(failed), (
+        f"报告里写的结论（{verdict}）和实际判不合格的名单（{failed}）对不上"
+    )
+    # 有没有关节没通过，决定的是"停不停"：停下来就必须说清是哪条判据没过，
+    # 而且必须是真的停住等人处理（不是打印一句"未通过"然后自己往下走）。
+    assert probe_result.aborted is bool(failed), (
+        "「有没有关节没通过」和「检查有没有停下来」对不上"
+    )
+    if failed:
+        assert "看不出来" in "\n".join(probe_result.lines), "没有说明是哪一条判据没过"
+        assert "暂停" in "\n".join(probe_result.lines)
+    # ★ 这里**不**断言"哪几个关节一定没通过"。判据门限（信噪比 ≥ 5、
+    # 位移 ≥ 噪声的 3 倍、以面内为主）一条都没动，但 0.05° 这一档在合成世界里
+    # 本来就贴着噪声边：合成棋盘格只有 480×360（r_rms≈62 px），J6 的合成灵敏度
+    # 恰好是 1 °/°，单帧转角噪声 0.02°。实测同一份代码、只把"连上设备后那次
+    # 5 s 采集检查"的时长从 1.0 s 换成 1.31/1.77/2.05 s（于是探针从相机的
+    # 另一段噪声实现里取帧），J6 的信噪比就在 1～9 之间跳、J1 在 2.8～25 之间跳，
+    # 谁不合格跟着换。那是**合成世界的噪声实现**，不是被测代码的性质——
+    # 把它写死成断言，等于把一次抽签结果当成需求。
+    # "看不出来就必须停下来"这条路，由
+    # ``test_the_gate_pauses_when_the_probe_is_too_small_to_see``
+    # 用一个确定看不出来的幅度（0.002°）单独盯死。
     # 拦下来之后仍然可以人工决定继续——需求三.B 说的是"暂停等人处理"，
     # 不是"禁止继续"。所以下面照常跑三档预实验。
 
@@ -269,6 +291,63 @@ def test_reusing_a_run_stamp_is_refused(tmp_path: Path, small_config) -> None:
     with pytest.raises(RecorderError) as info:
         create_run_directory(small_config, run_kind="dry-run", stamp=stamp)
     assert "覆盖" in str(info.value)
+
+
+def test_the_gate_pauses_when_the_probe_is_too_small_to_see(tmp_path: Path) -> None:
+    """★ 需求三.B 的确定性版本：探针**确定**看不出来时，必须停下来等人处理。
+
+    为什么把幅度压到 0.002° 再测一次（而不是复用 0.05°）
+    ----------------------------------------------------
+    0.05° 在合成世界里贴着噪声边：同一份代码换一段噪声实现（比如把"连上设备
+    后那次 5 s 采集检查"的时长从 1.0 s 改成 1.31 s，探针就从相机的另一段帧里
+    取图），J6 的信噪比会在 1～9 之间跳，结论跟着翻。上面那条端到端测试因此
+    **只**断言"结论和名单一致 + 没通过就停下来"，不再断言是谁没通过。
+
+    但"看不出来就停"这条路本身必须被真正走到。所以这里把幅度压到比噪声小
+    两个数量级——0.002° 在合成世界里是 J1 约 0.08 px、J6 约 0.002° 的图像
+    运动，而单帧识别噪声是 0.4～0.5 px / 0.02°，**任何**一次噪声实现都翻不过来
+    （实测信噪比 0.3～1.8，判据门限是 3 倍 / 5）。这不是"制造一个假的失败"，
+    而是现场真实会遇到的情形：人拿一个太小的幅度去试，工具必须告诉他
+    "这个幅度在画面上看不出来"，而不是自己挑一个数往下走。
+
+    同时确认"暂停"不是"锁死"：需求三.B 要的是停下来等人处理，
+    人决定继续之后流程必须走得动。
+    """
+    config = build_config(
+        tmp_path, joints=("J1", "J6"), amplitudes=(0.05, 0.2), repeats=1
+    )
+    config.pretest.quick_probe_deg = 0.002
+    config.validate()
+    session, _recorder = open_session(config, run_kind="probe-gate")
+    robot = session.robot
+    assert robot is not None
+    try:
+        session.capture_static(segment_id="static_base", duration_s=0.6)
+        before = set(robot.moved_event_ids())
+        result, failed = session.run_quick_probes()
+        text = "\n".join(result.lines)
+
+        assert set(failed) == {"J1", "J6"}, (
+            f"0.002° 比噪声小两个数量级，两个关节都该判「看不出来」，实际 {failed}"
+        )
+        assert result.aborted is True, "判了未通过却标成正常结束"
+        assert result.abort_reason, "停下来却没写原因"
+        assert "看不出来" in text, f"没有说明是哪一条判据没过：\n{text}"
+        assert "暂停" in text, f"没有写明是暂停等人处理：\n{text}"
+        for joint in ("J1", "J6"):
+            assert f"{joint} 快速几何检查：未通过" in text
+        # 判据读到的数必须**自洽**：位移确实小于噪声的 3 倍，信噪比确实低。
+        assert "位移不到噪声的 3.0 倍" in text
+
+        # 暂停≠锁死：人决定继续之后，后面的流程照常走得动（新的运动命令真的发出去了）。
+        assert session.aborted is False, (
+            "快速几何检查未通过不该把整个会话锁死——需求三.B 要的是暂停等人处理"
+        )
+        pretest = session.run_pretest()
+        assert pretest.segments, "人工决定继续之后预实验一段都没跑"
+        assert set(robot.moved_event_ids()) - before, "继续之后没有发出任何运动命令"
+    finally:
+        session.close()
 
 
 def test_analysis_needs_a_pretest_first(tmp_path: Path, small_config) -> None:

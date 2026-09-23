@@ -13,8 +13,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from sj_pretest.config import (
     AppConfig,
+    ConfigError,
     estimate_capture_seconds,
     estimate_disk_gb,
 )
@@ -36,23 +39,58 @@ def _hardware(config: AppConfig, roi: list[int] | None = None) -> AppConfig:
     return config
 
 
-def test_disk_estimate_follows_the_frame_size(tmp_path: Path) -> None:
-    """同样长的一段，满幅的占用必须是裁剪后的好几倍——这才是 ROI 的意义。"""
+def test_disk_estimate_uses_the_full_frame_not_the_analysis_roi(tmp_path: Path) -> None:
+    """★ v1.0.3：RAW 一律整幅保存，所以估算**不许**跟着 analysis_roi 变小。
+
+    以前这里正相反（配了 ROI 就按 ROI 的宽高估，估出来小好几倍）。现在那是错的：
+    离线 ROI 只在机器人停住之后用来减少背景干扰、加快识别，RAW 里存的仍是整幅。
+    拿 ROI 尺寸估会把这个组"要不要开始"的闸门整个架空——估 20 GB，实际写 200 GB。
+    """
     config = _hardware(
         build_config(tmp_path, joints=("J1",), amplitudes=(0.2,), repeats=1)
     )
     plan = build_static_plan(config.robot.nominal_joint_deg, duration_s=15.0)
+    seconds = estimate_capture_seconds(config, [plan])
 
-    config.camera.roi = [0, 0, 800, 600]
-    cropped = estimate_disk_gb(config, estimate_capture_seconds(config, [plan]))
-    config.camera.roi = None
-    full = estimate_disk_gb(config, estimate_capture_seconds(config, [plan]))
-
-    assert cropped > 0
-    assert full > cropped * 3.0, (
-        f"满幅({full:.2f} GB)居然没比裁剪({cropped:.2f} GB)大多少，"
-        "说明估算没读相机尺寸"
+    no_roi = estimate_disk_gb(config, seconds)
+    config.camera.analysis_roi = [0, 0, 800, 600]
+    config.validate()
+    with_roi = estimate_disk_gb(config, seconds)
+    assert with_roi == no_roi, (
+        f"配了分析 ROI 之后估算从 {no_roi:.2f} GB 变成了 {with_roi:.2f} GB——"
+        "分析 ROI 不该影响 RAW 大小"
     )
+
+    # 真正决定估算的是**传感器满幅**：换一块更大的传感器，估算必须跟着涨。
+    config.camera.sensor_width = 800
+    config.camera.sensor_height = 600
+    smaller = estimate_disk_gb(config, seconds)
+    assert no_roi > smaller * 3.0, (
+        f"把传感器改成 800×600 之后估算没跟着变（{smaller:.2f} vs {no_roi:.2f}）——"
+        "说明估算没读传感器尺寸"
+    )
+
+
+def test_the_legacy_roi_field_still_works_but_never_shrinks_the_raw(tmp_path: Path) -> None:
+    """旧字段 ``camera.roi`` 还能用（当分析 ROI），但**不再**让 RAW 变小。"""
+    config = _hardware(
+        build_config(tmp_path, joints=("J1",), amplitudes=(0.2,), repeats=1)
+    )
+    plan = build_static_plan(config.robot.nominal_joint_deg, duration_s=15.0)
+    seconds = estimate_capture_seconds(config, [plan])
+    baseline = estimate_disk_gb(config, seconds)
+
+    # 构造之后再赋值（界面的参数面板就是这么干的）：必须照样生效。
+    config.camera.roi = [10, 20, 700, 500]
+    config.validate()
+    assert config.camera.resolved_analysis_roi() == (10, 20, 700, 500)
+    assert estimate_disk_gb(config, seconds) == baseline
+    assert "旧字段 camera.roi" in config.camera.roi_migration_note()
+
+    # 两个字段都写且不一致：必须报错，不许悄悄挑一个。
+    config.camera.analysis_roi = [1, 2, 3, 4]
+    with pytest.raises(ConfigError):
+        config.validate()
 
 
 def test_capture_estimate_uses_the_formal_speed_for_formal_plans(
@@ -102,7 +140,9 @@ def test_planned_scale_lines_reports_minutes_and_gigabytes(tmp_path: Path) -> No
     text = "\n".join(planned_scale_lines(config))
     assert "整场实验规模" in text
     assert "分钟" in text and "GB" in text
-    assert "800×600" in text
+    # ★ v1.0.3：这里的尺寸是**全屏**尺寸，不是分析 ROI 的尺寸。
+    assert "1936×1096" in text
+    assert "800×600" not in text, "整场估算还在按分析 ROI 的尺寸报数"
     assert "估算" in text, "要明说这是估算，不是承诺"
 
 

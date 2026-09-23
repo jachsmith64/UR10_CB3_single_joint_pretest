@@ -81,13 +81,21 @@ def test_ui_lists_the_parameters_that_must_be_filled_on_site() -> None:
         "camera.mvs_import_path",
         "camera.exposure_us",
         "camera.gain",
-        "camera.roi",
+        # ★ v1.0.3：界面上填的是 camera.analysis_roi（**离线分析** ROI）。
+        # 它只决定机器人停住之后在画面哪一块找棋盘格，**不改变 RAW 的大小**
+        # ——RAW 一律整幅落盘。旧名 camera.roi 仍然能读（当分析 ROI 用），
+        # 但那是给老配置文件留的兼容口，不再出现在参数面板里：
+        # 面板上留一个叫 roi 的框，现场会以为它能裁 RAW。
+        "camera.analysis_roi",
         "camera.board_inner_corners",
         "pretest.joints",
         "pretest.amplitudes_deg",
         "paths.output_root",
     ):
         assert path in listed, f"{path} 在参数面板里改不了，只能改代码"
+    assert "camera.roi" not in listed, (
+        "参数面板里又出现了 camera.roi——现场会以为它能裁 RAW 尺寸"
+    )
 
 
 # --------------------------------------------------------------------------

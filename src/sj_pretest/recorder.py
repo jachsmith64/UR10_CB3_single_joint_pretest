@@ -131,6 +131,11 @@ class RobotStateRecorder:
         self._lock = threading.Lock()
         self.row_count = 0
         self._current_event: dict[str, Any] = {"event_id": None, "stage": None}
+        #: ★ 暂停标志。置上之后**任何**采样路径都直接返回：后台线程、同步采样、
+        #: 以及相机帧回调里那条 ``sample()`` 都一样。分组处理期间机械臂停着不动，
+        #: 再往里写 RTDE 行只会把"处理耗时"混进下一段的机器人状态流里，
+        #: 让第一层"指令 → 实际"的对齐凭空多出一段没有动作的时间。
+        self._paused = False
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -162,6 +167,38 @@ class RobotStateRecorder:
         if self.event_log is not None and self.threaded:
             self.event_log.write("rtde_recorder_stopped", rows=self.row_count)
 
+    # -- 暂停 / 恢复（分组处理期间用） -------------------------------------
+
+    @property
+    def paused(self) -> bool:
+        return bool(self._paused)
+
+    def pause(self, *, reason: str = "") -> None:
+        """暂停采样并**把文件刷干净**（v1.0.3 需求一·7）。
+
+        顺序是"先 flush 再置暂停"：反过来的话，正在写的那一行有可能还没落盘，
+        处理期间读 robot_states.csv 就会少几行——而 ``_verify_releasable``
+        恰恰要在处理期间读这个文件核对 RTDE 行数。刷盘之后再停，
+        读到的就是一份完整、自洽的文件。
+
+        已经在暂停状态时重复调用是安全的（幂等），不会重复写事件。
+        """
+        with self._lock:
+            if self._handle is not None:
+                self._handle.flush()
+            already = bool(self._paused)
+            self._paused = True
+        if not already and self.event_log is not None:
+            self.event_log.write("rtde_recorder_paused", reason=reason, rows=self.row_count)
+
+    def resume(self, *, reason: str = "") -> None:
+        """恢复采样。幂等。"""
+        with self._lock:
+            was = bool(self._paused)
+            self._paused = False
+        if was and self.event_log is not None:
+            self.event_log.write("rtde_recorder_resumed", reason=reason, rows=self.row_count)
+
     # -- 采样 -------------------------------------------------------------
 
     def mark(self, *, event_id: str, stage: str, label: str | None = None) -> None:
@@ -182,6 +219,11 @@ class RobotStateRecorder:
         帧和 RTDE 都在真实时钟上，不存在这个问题。
         """
         if self._handle is None:
+            return
+        if self._paused:
+            # 暂停期间**一次机器人读取都不做**：真机上 read_state 要过 RTDE，
+            # 处理阶段本来就该让链路静下来（需求一·7 要求处理期间不发运动命令，
+            # 顺便也不去读，免得和处理线程抢同一条连接）。
             return
         try:
             state = self.robot.read_state()

@@ -97,48 +97,68 @@ def test_only_the_raw_file_is_removed(tmp_path: Path) -> None:
         assert not list(segment_dir.glob("frames.raw*"))
 
 
+def _signature(report) -> list[tuple]:
+    """一份报告里"该逐位对上"的那些量。"""
+    return sorted(
+        (
+            item.joint,
+            item.stage,
+            round(float(item.amplitude_deg), 6),
+            int(item.direction),
+            # 视觉量：位移、信噪比、轴向/面内比值——这些数全靠这段的逐帧结果，
+            # RAW 删掉之后必须一模一样地重算出来。
+            None if item.snr is None else round(float(item.snr), 6),
+            None if item.vision_proj_px is None else round(float(item.vision_proj_px), 6),
+            None
+            if item.depth_ratio_upper is None
+            else round(float(item.depth_ratio_upper), 6),
+            item.depth_confidence,
+        )
+        for item in report.trials
+    )
+
+
 def test_offline_reanalysis_still_works_without_the_raw(tmp_path: Path) -> None:
-    """删完之后必须还能复算，而且结果和"RAW 还在"时一致。
+    """删完之后必须还能复算，而且结果和"RAW 还在"时**逐位**一致。
 
     这是整个功能的前提：RAW 换来的就是"事后还能算"，换不到就不该删。
+
+    ★ 为什么在**同一个会话**里先算一遍、把 RAW 删掉再算一遍，而不是跑两个会话
+    （一个删一个不删）去比：合成世界的逐帧噪声是按**帧号**播种的，而 v1.0.3 在
+    连接之后会先做一次 5 s 全屏采集检查、每组处理完还要丢几帧重建基线——
+    两个会话的帧号序列因此不同，"同一个实验"其实落在了两份不同的噪声实现上。
+    拿它们互相比，比出来的差异是噪声实现不同，不是"RAW 删了以后算不出来"。
+    同一个会话里两遍复算的**输入**完全一样，差异只可能来自"用不用 RAW"——
+    这才是这一条要证的事，而且比原来的比法更严（要求逐位相同，不是统计意义上相近）。
     """
-    kept_dir = tmp_path / "kept"
-    deleted_dir = tmp_path / "deleted"
-    kept_session, _kept_config, kept_report = _run(kept_dir, delete_raw=False)
-    deleted_session, _config, deleted_report = _run(deleted_dir, delete_raw=True)
+    config = build_config(tmp_path, joints=("J1",), amplitudes=(0.2,), repeats=1)
+    config.paths.delete_raw_after_process = False
+    config.validate()
+    session, recorder = open_session(config, run_kind="rolling")
+    try:
+        session.capture_static(segment_id="static_base", duration_s=0.6)
+        session.run_pretest()
+        assert session.run is not None
+        # 第一遍：RAW 还在，逐帧几何是从**像素**里现算出来的。
+        kept_report = session.analyze_offline(stride=1)
+        assert "离线识别" in recorder.text()
+        # 模拟"边采边清已经走完"：只删 RAW，别的一个字节都不动。
+        raw_files = sorted(session.run.segments_dir.glob("*/frames.raw"))
+        assert raw_files, "这一段流程本该写出过 RAW"
+        for raw in raw_files:
+            raw.unlink()
+        recorder.logs.clear()
+        # 第二遍：输入完全一样，只是 RAW 没了——必须能算出逐位相同的结论。
+        deleted_report = session.analyze_offline(stride=1)
+        text = recorder.text()
+    finally:
+        session.close()
 
-    assert kept_session.run is not None and deleted_session.run is not None
-    assert _deleted_events(kept_session) == [], "没开开关却删了 RAW"
-    assert _deleted_events(deleted_session), "开了开关却没删"
-
-    # 两边的 RAW 一个在、一个不在——这才叫同一个实验的两种落盘方式。
-    for segment_dir in kept_session.run.segments_dir.iterdir():
-        assert (segment_dir / "frames.raw").is_file()
-    for segment_dir in deleted_session.run.segments_dir.iterdir():
-        assert not (segment_dir / "frames.raw").is_file()
-
-    # 分析结论必须一致。报告里的试验条数、每条试验的关节/幅度/方向/推荐步长
-    # 都要对上——差一条就说明"删掉 RAW 之后有东西算不出来了"。
-    def signature(report):
-        return sorted(
-            (
-                item.joint,
-                item.stage,
-                round(float(item.amplitude_deg), 6),
-                int(item.direction),
-                # 视觉量：位移、信噪比、轴向/面内比值——这些数全靠这段的逐帧结果，
-                # RAW 删掉之后必须一模一样地重算出来。
-                None if item.snr is None else round(float(item.snr), 6),
-                None if item.vision_proj_px is None else round(float(item.vision_proj_px), 6),
-                None
-                if item.depth_ratio_upper is None
-                else round(float(item.depth_ratio_upper), 6),
-                item.depth_confidence,
-            )
-            for item in report.trials
-        )
-
-    assert signature(kept_report) == signature(deleted_report), (
+    assert "原始帧已按边采边清删除" in text, (
+        "第二遍分析没有走「用段内已保存的逐帧结果复算」这条路——"
+        f"那它比的就还是像素，不是留下的派生数据。\n{text}"
+    )
+    assert _signature(kept_report) == _signature(deleted_report), (
         "只靠留下的逐帧结果复算出来的结论，和 RAW 还在时不一致"
     )
     assert [item.to_dict() for item in kept_report.recommendations] == [
@@ -147,6 +167,7 @@ def test_offline_reanalysis_still_works_without_the_raw(tmp_path: Path) -> None:
     assert kept_report.warnings == deleted_report.warnings, (
         "两次分析的告警不一样，说明有一条路径缺数据"
     )
+
 
 
 def test_the_deleted_raw_is_the_one_that_was_hashed(tmp_path: Path) -> None:

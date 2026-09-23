@@ -304,9 +304,13 @@ def test_disk_gate_stops_the_stage_before_any_motion(tmp_path: Path) -> None:
 def test_dropped_frames_are_recorded_and_reported(tmp_path: Path) -> None:
     """注入丢帧：采集里要看得见缺口，日志里要提示，不能悄悄少几帧。"""
     config = build_config(tmp_path, joints=("J1",), amplitudes=(0.2,), repeats=1)
-    config.dry_run.drop_every = 7  # 每 7 帧丢 1 帧
     recorder = Recorder(answer=True)
     session, recorder = open_session(config, recorder=recorder)
+    # ★ 丢帧要**在连上设备之后**才开始注入（合成源逐帧现读这个值）。
+    # 连接设备时那次全屏采集检查干的正是这件事：帧率不够、缺帧超限就禁止运动。
+    # 要是检查期间就在丢帧，检查会（正确地）拒绝开始，这一段就测不到
+    # "采集中丢帧怎么记进元数据"了——那是这条用例真正要看的东西。
+    config.dry_run.drop_every = 7  # 每 7 帧丢 1 帧
     try:
         session.capture_static(segment_id="static_drop", duration_s=0.4)
         session.run_pretest()

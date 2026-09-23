@@ -9,8 +9,10 @@
   outputs\dryrun_example\run_manifest.json
   outputs\dryrun_example\segments\  （每个动作一个子目录）
 
-想清理这次示例占的空间（原始帧可能有几百 MB）：
-  直接删掉 outputs\dryrun_example\segments\*\frames.raw 即可，
+这一版默认开着「分组处理并删除 RAW」：每一组校验通过之后 RAW 就已经自动删掉了，
+  段目录里留下的是逐帧结果、角点表和样例图——删掉 RAW 之后照样能复算。
+  如果你在参数面板里把那个开关关掉过，示例留下的 frames.raw 可以自己清理：
+  删掉 outputs\dryrun_example\segments\*\frames.raw 即可，
   文本记录和样例图都可以留着。
 
 下一步：双击 run_ui.bat 打开界面，按 ①②③ 三个按钮往下走。

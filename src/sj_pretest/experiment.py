@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -46,10 +47,13 @@ from .analysis import (
 from .config import (
     JOINT_NAMES,
     AppConfig,
+    MeasuredCapture,
     check_free_disk,
     check_group_disk,
     check_plan_disk,
+    group_forecast,
     group_peak_gb,
+    segment_step_groups,
     trial_plan_summary,
 )
 from .joint_space import (
@@ -64,6 +68,7 @@ from .joint_space import (
     build_static_plan,
     joint_delta,
     nominal_offset_summary,
+    planned_scale_lines,
 )
 from .recorder import (
     RobotStateRecorder,
@@ -185,6 +190,19 @@ class SegmentPlan:
         return self.primary.target_joint_deg is None
 
     @property
+    def end_target(self) -> Sequence[float] | None:
+        """这一段**走完之后**机械臂停在哪个目标姿态。
+
+        有收尾回程步就用它（本段最后停的地方），否则用主步的目标。
+        分组时靠它判断"这一段是不是停在名义姿态"——只有停在名义姿态的地方
+        才是安全的分组边界（需求一·4）。
+        """
+        target = self.follow.target_joint_deg if self.follow is not None else None
+        if target is None:
+            target = self.primary.target_joint_deg
+        return target
+
+    @property
     def statistics_event_id(self) -> str | None:
         """计入统计的那一步的事件编号（本段是它的采集）。"""
         if self.primary.event.counts_for_statistics:
@@ -206,33 +224,407 @@ def iter_segment_plans(plan: MotionPlan) -> list[SegmentPlan]:
 
     组 A 的阶梯回程**不是**这种收尾步（它降到第 k−1 级，不是回名义），
     所以不会被并进来，而是各自成段——需求五要求去程和回程分别分析。
+
+    ★ 切分规则本身在 :func:`sj_pretest.config.segment_step_groups` 里，
+    这里只是把结果包成 :class:`SegmentPlan`。**必须只有一份规则**：
+    磁盘估算和界面上的"本组多少段、要录多久"走的是同一个函数，
+    两处各写一份的话，估出来的段数和真跑出来的段数迟早会对不上。
     """
-    steps = list(plan.steps)
-    consumed: set[int] = set()
-    segments: list[SegmentPlan] = []
-    for index, step in enumerate(steps):
-        if index in consumed:
-            continue
-        if step.target_joint_deg is None:
-            segments.append(SegmentPlan(primary=step))
-            continue
-        follow: PlannedStep | None = None
-        if index + 1 < len(steps):
-            candidate = steps[index + 1]
-            if (
-                candidate.target_joint_deg is not None
-                and candidate.event.role == ROLE_RETURN
-                and candidate.event.expected_delta_deg == 0.0
-            ):
-                follow = candidate
-                consumed.add(index + 1)
-        segments.append(SegmentPlan(primary=step, follow=follow))
-    return segments
+    return [
+        SegmentPlan(primary=group[0], follow=(group[1] if len(group) > 1 else None))
+        for group in segment_step_groups(list(plan.steps))
+    ]
 
 
-# --------------------------------------------------------------------------
-# 一次运行
-# --------------------------------------------------------------------------
+def _segment_ends_at_nominal(segment_plan: SegmentPlan, nominal: tuple[float, ...]) -> bool:
+    """这一段走完之后，是否**已经回到名义姿态**（可以安全地停下来处理）。
+
+    只有"回到名义"的地方才是安全的组边界：机械臂停在那儿就是实验姿态，
+    下一组可以从此处直接开始；停在阶梯中间的话，下一组要先走一段"回到名义"
+    的运动，那一段没人看过、也没被任何一段画面覆盖。
+    """
+    target = segment_plan.end_target
+    if target is None:
+        return False
+    return all(
+        abs(float(a) - float(b)) <= 1e-9 for a, b in zip(target, nominal)
+    )
+
+
+def repeat_segment_groups(
+    segment_plans: Sequence[SegmentPlan],
+) -> list[tuple[int, list[SegmentPlan]]]:
+    """按**每一遍 repeat** 把段切开：``[(repeat_index, [段, …]), …]``。
+
+    ★ v1.0.3 需求一·4：正式实验的组 A / 组 B 都必须"**每一遍 repeat 单独成组**"，
+    不能把 5 循环 × 2 方向 × 3 遍塞成一组。一遍 repeat 结束正好回到名义姿态，
+    天然就是安全边界（需求一·4 指定的"停止运动 → 处理 → 校验 → 删 RAW"的位置）。
+
+    组内顺序**原样保留**，也**不丢任何一段**——这个函数只决定"在哪儿停"，
+    不决定"做什么"。切完之后会核对"所有段都还在、顺序没变"，
+    免得以后有人在这里顺手过滤掉几段（那正是"偷偷减少动作数量"）。
+    """
+    groups: list[tuple[int, list[SegmentPlan]]] = []
+    current_key: int | None = None
+    current: list[SegmentPlan] = []
+    for segment_plan in segment_plans:
+        key = int(segment_plan.primary.event.repeat_index or 1)
+        if current and key != current_key:
+            groups.append((int(current_key or 1), current))
+            current = []
+        current_key = key
+        current.append(segment_plan)
+    if current:
+        groups.append((int(current_key or 1), current))
+    _assert_partition(segment_plans, [items for _key, items in groups], "按遍分组")
+    return groups
+
+
+def nominal_split_segment_groups(
+    nominal_joint_deg: Sequence[float], segment_plans: Sequence[SegmentPlan]
+) -> list[list[SegmentPlan]]:
+    """在**每一个"已经回到名义姿态"的边界**上切开（比按遍更细的一级）。
+
+    用途只有一个：某一遍 repeat 自己就超过磁盘硬上限时，**只在安全边界上**再拆
+    （需求一·4 说的正是"只能在已经回到名义姿态的边界上再拆，例如组B 按正负循环"）。
+
+    * 组 B 的每一遍是"正循环 + 回名义 + 负循环 + 回名义"，每个回名义都是安全点，
+      所以这一级能把一遍拆成若干更小的组；
+    * 组 A 的一遍是"阶梯上去再原路下来"，**中途没有回名义的点**，
+      所以这一级和按遍分组的结果一样——也就是说组 A 的一遍拆不动，
+      真超了就只能拒绝开始（见 ``plan_formal_groups``）。
+
+    纯等待段没有运动，不算边界，也不单独成组：它跟着它前面那一组走。
+    """
+    nominal = tuple(float(v) for v in nominal_joint_deg)
+    count = len(segment_plans)
+    if count == 0:
+        return []
+    motion_flags = [not plan.is_wait_only for plan in segment_plans]
+    if not any(motion_flags):
+        return [list(segment_plans)]
+    last_motion = max(index for index, flag in enumerate(motion_flags) if flag)
+    cuts: list[int] = []
+    for index, segment_plan in enumerate(segment_plans):
+        if not motion_flags[index]:
+            continue
+        if index >= last_motion:
+            continue  # 后面没有运动段了，在这里切只会切出一个等待尾巴
+        if not _segment_ends_at_nominal(segment_plan, nominal):
+            continue
+        # 切点落在紧随其后的等待段之后：等待属于它前面的那一组（它录的是
+        # "停下来这段时间"，不是下一组的开头）。
+        cut_at = index + 1
+        while cut_at < count and not motion_flags[cut_at]:
+            cut_at += 1
+        if cut_at < count:
+            cuts.append(cut_at)
+    groups: list[list[SegmentPlan]] = []
+    start = 0
+    for cut_at in sorted(set(cuts)):
+        groups.append(list(segment_plans[start:cut_at]))
+        start = cut_at
+    if start < count:
+        groups.append(list(segment_plans[start:]))
+    _assert_partition(segment_plans, groups, "按回名义姿态的边界分组")
+    return groups
+
+
+def _assert_partition(
+    original: Sequence[SegmentPlan],
+    groups: Sequence[Sequence[SegmentPlan]],
+    what: str,
+) -> None:
+    """核对"切完还是原来那些段、顺序也没变、一段都没少"。切错是要出事的。"""
+    flat = [item for group in groups for item in group]
+    if len(flat) != len(original) or any(
+        a is not b for a, b in zip(flat, original)
+    ):
+        raise ExperimentError(
+            f"{what}把计划切坏了：原本 {len(original)} 段，切完是 {len(flat)} 段，"
+            "或者顺序/身份发生了变化。分组只允许决定'在哪儿停'，"
+            "绝不允许增删或重排任何一步。"
+        )
+
+
+def _merge_within_cap(
+    config: AppConfig,
+    atoms: Sequence[Sequence[SegmentPlan]],
+    *,
+    measured: MeasuredCapture | None = None,
+) -> list[list[SegmentPlan]]:
+    """把"最细的安全切法"再**尽量合并**成少数几组，合并后仍不超上限。
+
+    为什么要有这一步：``nominal_split_segment_groups`` 切在**每一个**"已经回到
+    名义姿态"的边界上，组 B 的一遍有十几个这样的点，直接照它分组会变成十几个
+    "停下来处理一次"——每停一次都要人等着，现场不可用。而需求一·4 要的是
+    "**只在**这个边界上再拆（例如组 B 按正负循环拆）"：边界是**唯一允许**的
+    切点，不是"必须每个都切"。
+
+    所以这里从前往后贪心：能并进当前组就并，并进去就超上限了才切——结果就是
+    "在满足磁盘限制的前提下，停的次数最少"。切点仍然**全部**来自安全边界，
+    一段都没增删、没重排（``_assert_partition`` 在调用方把关）。
+
+    合并只看**硬上限**（见 :func:`_over_hard_cap`），不看可用空间：盘满没满
+    由 :meth:`ExperimentSession._require_group_disk` 单独报，两件事不混在
+    一个判据里——否则盘一满，合并就会被卡成"每次动作都停下来处理一次"。
+    """
+    merged: list[list[SegmentPlan]] = []
+    current: list[SegmentPlan] = []
+    for atom in atoms:
+        if current:
+            trial = [*current, *atom]
+            if _over_hard_cap(config, trial, measured=measured):
+                merged.append(current)
+                current = []
+        current.extend(atom)
+    if current:
+        merged.append(current)
+    _assert_partition([item for atom in atoms for item in atom], merged, "在安全边界上合并")
+    return merged
+
+
+@dataclass
+class FormalGroupPlan:
+    """正式实验里"这一组的段"以及它的名字（需求一·4）。"""
+
+    name: str
+    what: str
+    segments: list[SegmentPlan]
+    #: 这一组是用哪一级切分得到的：``repeat`` = 每遍一组；``nominal`` = 再拆细一级。
+    level: str = "repeat"
+
+
+def plan_formal_groups(
+    config: AppConfig,
+    segment_plans: Sequence[SegmentPlan],
+    nominal_joint_deg: Sequence[float],
+    group: str,
+    joint: str,
+    *,
+    measured: MeasuredCapture | None = None,
+) -> list[FormalGroupPlan]:
+    """决定正式实验里这一关节的段怎么分组，**在发任何运动命令之前**。
+
+    默认永远是"每一遍 repeat 单独一组"（需求一·4 原文）。只有在某一遍自己就超过
+    磁盘硬上限时才允许再拆一级，而且**只能拆在"已经回到名义姿态"的边界上**。
+    组 A 的一遍中途没有这种边界，所以它拆不动——那就**拒绝开始并说明原因**，
+    绝不为了让磁盘过得去而少走几步、少重复几遍或者降帧率（需求一·4 禁止这三件事）。
+
+    返回的组按顺序覆盖全部段，且一段不多一段不少（``_assert_partition`` 把关）。
+    """
+    short = f"组{group.upper()} {joint}"
+    repeat_groups = repeat_segment_groups(segment_plans)
+    default = [
+        FormalGroupPlan(
+            name=f"{short} 第{index}遍",
+            what=f"{short} 第 {index}/{len(repeat_groups)} 遍",
+            segments=list(items),
+            level="repeat",
+        )
+        for index, items in repeat_groups
+    ]
+
+    bad = _over_cap_groups(config, default, measured=measured)
+    if not bad:
+        return default
+
+    # 默认分组里有超上限的：只在"已经回到名义姿态"的边界上再拆一级试试。
+    refined = _refine_at_nominal_boundaries(
+        config,
+        segment_plans,
+        nominal_joint_deg,
+        measured=measured,
+        name_of=lambda position, total: f"{short} 第{position}小段",
+        what_of=lambda position, total: (
+            f"{short} 第 {position}/{total} 小段（只在已回到名义姿态处再拆）"
+        ),
+    )
+    if refined is not None:
+        return refined
+    bad = _over_cap_groups(config, default, measured=measured) or bad
+    raise _over_cap_refusal(
+        config,
+        short,
+        bad,
+        measured=measured,
+        why=(
+            "不能再往下拆了：再拆只能拆在「没有回到名义姿态」的地方，"
+            "机械臂会停在阶梯中间，下一组要先走一段没人看过、也没被任何画面覆盖的运动。"
+        ),
+    )
+
+
+def _over_hard_cap(
+    config: AppConfig,
+    segments: Sequence[SegmentPlan],
+    *,
+    measured: MeasuredCapture | None,
+) -> bool:
+    """这一组按**实测**尺寸算，是否超过 50 GB 硬上限。**只看尺寸，不看可用空间。**
+
+    为什么把"盘满没满"排除在外：要不要"再拆细一级"只取决于这一组的**大小**。
+    盘满了是另一回事——拆得再小也一样写不下，那种情况该由
+    ``_require_group_disk`` 用"按计划需要约 X GB、可用空间不够"的话来拒绝，
+    而不是被误报成"这一组太大、拆不动"。两件事用两套话分开说，现场才知道
+    该去清盘还是该改参数。
+    """
+    if not bool(config.paths.delete_raw_after_process):
+        return False  # 流水线没开：RAW 全程累积，不拿单组硬上限来卡
+    forecast = group_forecast(config, segments, measured=measured)
+    return forecast.peak_gb > float(config.paths.max_peak_disk_gb)
+
+
+def _over_cap_groups(
+    config: AppConfig,
+    groups: Sequence[FormalGroupPlan],
+    *,
+    measured: MeasuredCapture | None,
+) -> list[str]:
+    """哪些组按**实测**尺寸算下来超了硬上限（只看尺寸，见 :func:`_over_hard_cap`）。"""
+    return [
+        item.what
+        for item in groups
+        if _over_hard_cap(config, item.segments, measured=measured)
+    ]
+
+
+def _refine_at_nominal_boundaries(
+    config: AppConfig,
+    segment_plans: Sequence[SegmentPlan],
+    nominal_joint_deg: Sequence[float],
+    *,
+    measured: MeasuredCapture | None,
+    name_of: Callable[[int, int], str],
+    what_of: Callable[[int, int], str],
+) -> list[FormalGroupPlan] | None:
+    """在"已经回到名义姿态"的边界上再拆一级并尽量合并。**拆完仍然超上限就返回 None。**
+
+    需求一·4：细分只允许发生在"已经回到名义姿态"的边界上（那是唯一"停下来处理"
+    安全的位置）。切点全由 :func:`nominal_split_segment_groups` 给出，
+    再用 :func:`_merge_within_cap` 合并成尽量少的组（"可以在这里切"不等于
+    "必须每个点都切"，否则现场要停几十次）。返回 ``None`` 表示这一级也放不下。
+    """
+    finer = nominal_split_segment_groups(nominal_joint_deg, segment_plans)
+    if len(finer) <= 1:
+        return None  # 一个安全切点都没有：这一级拆不动
+    merged = _merge_within_cap(config, finer, measured=measured)
+    plans = [
+        FormalGroupPlan(
+            name=name_of(position, len(merged)),
+            what=what_of(position, len(merged)),
+            segments=list(items),
+            level="nominal",
+        )
+        for position, items in enumerate(merged, start=1)
+    ]
+    if _over_cap_groups(config, plans, measured=measured):
+        return None
+    return plans
+
+
+def _over_cap_refusal(
+    config: AppConfig,
+    what: str,
+    bad: Sequence[str],
+    *,
+    measured: MeasuredCapture | None,
+    why: str,
+) -> ExperimentError:
+    """"拆到最小也放不下"的拒绝理由：**在发任何运动命令之前**抛出去。
+
+    尺寸/帧率一律取"现场真实值"：有 5 s 检查的实测值就用它，没有就退回配置名义值
+    并**明说是名义值**——不能打印出"0×0 @ 0.00 fps"这种一眼看不出是哪种口径的数。
+    """
+    if measured is not None:
+        size_fps = (
+            f"按实测的 {measured.width}×{measured.height} @ {measured.fps:.2f} fps"
+        )
+    else:
+        width, height = config.effective_camera_size(None)
+        size_fps = (
+            f"按配置名义值 {width}×{height} @ {config.effective_fps(None):.2f} fps"
+            "（还没有 5 s 全屏采集检查的实测值）"
+        )
+    return ExperimentError(
+        f"{what}没有开始：**{size_fps}** 算，"
+        "拆到最小也还是放不下（超了 "
+        f"{config.paths.max_peak_disk_gb:.0f} GB 的硬上限）：\n"
+        + "\n".join(f"  · {item}" for item in bad)
+        + f"\n{why}\n"
+        "不许为了让磁盘过得去而减少动作数量、重复次数或采集帧率。\n"
+        "能做的三件事：把这一组的关节拆到别的运行目录里分批做；"
+        "换/清一个更大的输出盘；或者把相机分辨率与帧率降到你真正需要的那一档"
+        "（那属于改实验设计，要人来决定，工具不会替你改）。"
+    )
+
+
+def plan_pretest_groups(
+    config: AppConfig,
+    segment_plans: Sequence[SegmentPlan],
+    *,
+    measured: MeasuredCapture | None = None,
+) -> list[FormalGroupPlan]:
+    """三档预实验的分组：默认**每个关节一组**，超硬上限时才在名义姿态边界上再拆。
+
+    ★ 需求一·4 给预实验定的组边界就是"每个关节一组"。这里额外处理一种情况：
+    某个关节的一组**自己就超过硬上限**（幅度档数、每方向重复次数、或现场帧率
+    比预期大得多时会发生）。预实验每一次动作都从名义姿态**独立出发**再回到名义，
+    所以"已经回到名义姿态"的边界到处都是——那就照需求一·4 的兜底规则在这些
+    边界上再拆，而不是直接拒绝；只有连**单次动作**都放不下时，才在运动开始之前
+    拒绝并说明原因。
+
+    返回的组按顺序覆盖全部段，一段不多一段不少（``_assert_partition`` 把关）。
+    """
+    by_joint: dict[Any, list[SegmentPlan]] = {}
+    for item in segment_plans:
+        by_joint.setdefault(item.primary.event.joint, []).append(item)
+    default = [
+        FormalGroupPlan(
+            name=f"预实验 {joint}",
+            what=f"预实验 {joint}",
+            segments=list(items),
+            level="repeat",
+        )
+        for joint, items in by_joint.items()
+    ]
+    nominal = config.robot.nominal_joint_deg
+    groups: list[FormalGroupPlan] = []
+    for item in default:
+        if not _over_cap_groups(config, [item], measured=measured):
+            groups.append(item)
+            continue
+        joint = item.segments[0].primary.event.joint
+        refined = _refine_at_nominal_boundaries(
+            config,
+            item.segments,
+            nominal,
+            measured=measured,
+            name_of=lambda position, total: f"预实验 {joint} 第{position}小段",
+            what_of=lambda position, total: (
+                f"预实验 {joint} 第 {position}/{total} 小段"
+                "（只在已回到名义姿态处再拆）"
+            ),
+        )
+        if refined is None:
+            bad = _over_cap_groups(config, [item], measured=measured)
+            raise _over_cap_refusal(
+                config,
+                f"预实验 {joint}",
+                bad,
+                measured=measured,
+                why=(
+                    "不能再往下拆了：预实验的每一次动作**本身**就是最小的安全单位"
+                    "（每次动作都从名义姿态独立出发、再回到名义姿态），"
+                    "再拆只能拆在「没有回到名义姿态」的地方。"
+                ),
+            )
+        groups.extend(refined)
+    _assert_partition(
+        segment_plans, [item.segments for item in groups], "预实验分组"
+    )
+    return groups
+
 
 
 @dataclass
@@ -291,6 +683,15 @@ class ExperimentSession:
         #: ★ 这是"RAW 删掉之后不要再去读 frames.raw"（需求二）的落地处：
         #: 快速几何检查等下游直接用这一份，而不是重新 process_segment 一遍。
         self._released_vision: dict[str, SegmentVision] = {}
+
+        # -- 连接设备后的 5 s 全屏采集检查（需求一·3） ------------------------
+        #: 实测到的分辨率/帧率/帧字节数/写盘速度。**所有**磁盘估算都用它，
+        #: 而不是配置里的名义值——名义值和真机差一点点就是"这组能不能开始"。
+        self.measured: MeasuredCapture | None = None
+        #: 检查结论（字典，原样给人看）。None = 还没做过。
+        self.capture_check: dict[str, Any] | None = None
+        #: 检查是否通过。None = 还没做；False = 做了但没通过（禁止运动）。
+        self.capture_check_ok: bool | None = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -543,6 +944,16 @@ class ExperimentSession:
         self.hooks.log(
             "已读取当前关节角：" + "、".join(f"{v:.4f}" for v in state.actual_q_deg)
         )
+        # ★ 需求一·3：**连上设备之后立刻**做 5 s 全屏采集检查，在任何运动之前。
+        # 就放在这里，而不是放在"开始实验"按钮里：位置越靠前，越不可能有人在
+        # 没量过这台机器的情况下把机械臂开起来。
+        # 它自己不发任何运动命令；不通过就拒绝一切运动（见 require_capture_check）。
+        if self.engine is not None and self.pump is not None:
+            self.run_connection_check()
+        else:
+            self.hooks.log(
+                "[连接检查] 会话还没有图像来源，5 s 全屏采集检查推迟到打开来源之后。"
+            )
         return facts
 
     def approach_plan(self) -> MotionPlan:
@@ -581,6 +992,8 @@ class ExperimentSession:
         """逐步走到实验姿态：每一步都确认、每步后给一张预览图。"""
         if self.robot is None or self.pump is None or self.run is None:
             raise ExperimentError("会话还没打开：请先调用 open()。")
+        # ★ 到位本身就是运动，所以这里也必须在 5 s 采集检查通过之后才允许开始。
+        self.require_capture_check("到位过程")
         config = self.config
         plan = self.approach_plan()
         result = SessionResult(title="到位过程")
@@ -666,7 +1079,10 @@ class ExperimentSession:
                 # ★ 界面上除了一张**裁剪后**的真实预览图，还要同时给出
                 # 原始画面尺寸 / ROI 坐标 / 裁剪后尺寸这三个数（需求三）：
                 # 只看裁剪后的图，人没法判断 ROI 坐标是不是写歪了。
-                note = f"到位 {index}/{len(plan.steps)}（预览图 = RAW 里实际存下的裁剪画面）"
+                note = (
+                    f"到位 {index}/{len(plan.steps)}"
+                    "（预览图 = 整幅画面，红框是离线分析 ROI；RAW 另存整幅）"
+                )
                 if roi_lines:
                     note = note + "\n" + "\n".join(roi_lines)
                 self.hooks.on_preview(preview, note)
@@ -689,10 +1105,10 @@ class ExperimentSession:
         这两件事只用**一张**帧，所以耗时是"一次识别"（约 150 ms），
         不会拖慢采集——因为此刻并没有在采集。
 
-        ★ 这里的裁剪**必须**和 RAW 落盘用同一份 ROI（``engine.crop``）：
-        预览图里看到的画面 = RAW 里真正存下的画面 = 离线识别要处理的画面。
-        以前预览用的是**未裁剪**的整幅图，于是"预览里棋盘格好好的、
-        离线分析却在裁过的图里找不齐角点"这种事会在现场发生。
+        ★ v1.0.3（需求一·2）：RAW 一律整幅保存，所以预览图也**存整幅**，
+        只在上面画出离线分析 ROI 的红框（``analysis_preview_image``）。
+        判据仍然按**分析窗口**算——那才是离线识别真正会看的一块，
+        棋盘格跑到框外就必须拦住，哪怕 RAW 里其实还看得见它。
 
         返回 ``(预览图路径 或 None, 检查结论文字, ROI 三行说明)``。
         第三项是给界面直接显示的（需求三：原始画面尺寸 / ROI 坐标 / 裁剪后尺寸），
@@ -716,8 +1132,8 @@ class ExperimentSession:
                 self.run.root / "approach_previews" / f"{index:02d}_{safe_name(event_id)}.png"
             )
             preview_path.parent.mkdir(parents=True, exist_ok=True)
-            # 存的就是裁过的图（和 RAW 一致）。
-            cv2.imwrite(str(preview_path), np_as_uint8(cropped))
+            # 存的是**整幅**（和 RAW 一致），ROI 只是个红框。
+            cv2.imwrite(str(preview_path), self.analysis_preview_image(frame))
         corners_note, margin_ok = self._check_board_frame(cropped)
         verdict = "通过" if margin_ok else "未通过"
         text = (
@@ -736,12 +1152,50 @@ class ExperimentSession:
             )
         return preview_path, text, roi_lines
 
-    def _crop_with_roi(self, frame: Any) -> tuple[Any | None, list[str], bool]:
-        """按 RAW 的那一份 ROI 裁一帧，并给出"原始尺寸/ROI/裁剪后尺寸"三行说明。
+    def analysis_preview_image(self, frame: Any) -> Any:
+        """给界面看的预览图：**整幅原图**，在上面把离线分析 ROI 画成框。
 
-        返回 ``(裁剪后的帧 或 None, 中文说明行, 是否成功)``。
+        ★ v1.0.3（需求一·2）：预览可以显示整幅并在上面画 ROI 框，但不得改变 RAW。
+        以前预览存的是**裁过的图**，于是"人看到的画面"被人当成"RAW 里存的画面"，
+        配了 ROI 之后还会让人误以为 RAW 也被裁小了。现在预览如实显示整幅，
+        分析窗口只是个框——框歪了、框偏了，人一眼就能看出来。
+
+        灰度图会被转成三通道 BGR，只为把框画成彩色（红色），
+        不改动任何像素值，也不参与任何数值判据。
+        """
+        import cv2
+
+        image = np_as_uint8(frame)
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        roi = self.engine.analysis_roi if self.engine is not None else None
+        if roi is not None:
+            x, y, w, h = (int(v) for v in roi)
+            # 画在整幅图上，颜色为红色（BGR），线宽取到人眼在缩略图上也能看见。
+            cv2.rectangle(image, (x, y), (x + w - 1, y + h - 1), (0, 0, 255), 2)
+            cv2.putText(
+                image,
+                "analysis ROI",
+                (x + 4, y + 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        return image
+
+    def _crop_with_roi(self, frame: Any) -> tuple[Any | None, list[str], bool]:
+        """按**离线分析 ROI** 裁一帧，并给出尺寸/ROI/偏移的说明行。
+
+        返回 ``(分析窗口 或 None, 中文说明行, 是否成功)``。
         越界时返回 None 而不是抛异常：调用方要在界面上把**为什么**说清楚，
         而不是丢一个栈。
+
+        ★ v1.0.3：裁出来的这一块**只代表离线分析会看的那一块画面**，它
+        **不再**是 RAW 的样子（RAW 是整幅）。所以这些说明行里写的是
+        "原始帧尺寸 / RAW 实际保存尺寸 / 离线分析 ROI"，别再把分析窗口
+        当成 RAW 的尺寸报出去。
         """
         if self.engine is None:
             return frame, [], True
@@ -750,7 +1204,7 @@ class ExperimentSession:
         if not report.get("ok", True):
             return None, lines, False
         try:
-            return self.engine.crop(frame), lines, True
+            return self.engine.analysis_crop(frame), lines, True
         except Exception as exc:  # pragma: no cover - roi_report 已经先拦过一遍
             lines.append(f"裁剪失败：{exc}")
             return None, lines, False
@@ -875,7 +1329,7 @@ class ExperimentSession:
 
         ``plans`` 传计划对象（有 ``steps``）或步骤序列都行。
         """
-        ok, lines = check_plan_disk(self.config, plans)
+        ok, lines = check_plan_disk(self.config, plans, measured=self.measured)
         for line in lines:
             self.hooks.log(f"[磁盘] {line}")
         if self.run is not None:
@@ -887,23 +1341,230 @@ class ExperimentSession:
         return lines
 
     # ------------------------------------------------------------------
+    # 连接设备后的 5 s 全屏采集检查（需求一·3）
+    # ------------------------------------------------------------------
+
+    def run_connection_check(self) -> dict[str, Any]:
+        """连上设备之后、**任何运动之前**：采 5 s 全屏 RAW，量五个真实值。
+
+        量的是：实际原始分辨率、实际帧率、帧号连续性（缺帧数量与比例）、
+        实际 RAW 字节数、实际每秒写盘速度。这五个值随后用来重算每一组的磁盘峰值
+        （见 ``_require_group_disk`` / ``group_forecast``）——**不**用配置里的名义值，
+        也不用分析 ROI 的尺寸。
+
+        这 5 s 里**机械臂不动**，也不发任何运动命令。检查通过后把这次测的 RAW 删掉，
+        只留下：汇总 JSON/TXT、帧率/缺帧/写盘速度、少量样本图、实际分辨率——
+        这四样足以让后来的人复核"当时这台机器到底能采成什么样"。
+
+        不通过就**禁止运动**（见 :meth:`require_capture_check`），并且中文说清是哪一种：
+        帧率不足 / 掉帧 / 磁盘写入不足。
+        """
+        config = self.config
+        if self.engine is None or self.pump is None or self.run is None:
+            raise ExperimentError("会话还没打开：请先调用 open()。")
+        seconds = float(config.camera.connection_check_s)
+        segment_id = "connection_check"
+        # ★ 落在运行目录下的**独立**子目录，不放进 segments/：
+        # 它不是一段实验数据（不属于任何一组、不进任何统计分析），
+        # 混进 segments/ 会让"这次实验到底采了几段"这类事后对账多出一样东西。
+        out_dir = self.run.root / "connection_check"
+        self.hooks.log(
+            f"[连接检查] 开始 {seconds:.1f} s 全屏采集检查："
+            "机械臂保持不动，只量分辨率/帧率/缺帧/写盘速度。"
+        )
+        record = self.engine.capture_segment(
+            out_dir,
+            segment_id=segment_id,
+            kind="connection_check",
+            duration_s=seconds,
+            stop_requested=self.hooks.stop_requested,
+            metadata_extra={
+                "stage": "connection_check",
+                "counts_for_statistics": False,
+                "no_motion_sent": True,
+            },
+        )
+        raw_path = out_dir / "frames.raw"
+        raw_bytes = int(raw_path.stat().st_size) if raw_path.is_file() else 0
+        width = int((record.metadata.get("raw_size") or [0, 0])[0])
+        height = int((record.metadata.get("raw_size") or [0, 0])[1])
+        fps = float(record.actual_camera_fps)
+        # 写盘速度用"写下去的字节 ÷ 这段真实花掉的墙上时间"。它把取帧、拷贝、落盘
+        # 三件事都算进去了，正是"这台机器能不能跟上这台相机"的答案。
+        write_mbps = (
+            float(raw_bytes) / 1e6 / float(record.wall_seconds)
+            if record.wall_seconds > 0
+            else None
+        )
+        measured = MeasuredCapture(
+            width=width,
+            height=height,
+            fps=fps,
+            frames=int(record.frame_count),
+            seconds=float(record.duration_s),
+            dropped_ratio=float(record.dropped_ratio),
+            missing_frames=int(record.missing_frames),
+            write_mbps=write_mbps,
+            source=f"连接设备后的 {seconds:.1f} s 全屏采集检查",
+        )
+
+        # -- 三种失败，分开判、分开说 ------------------------------------
+        expected_fps = float(config.effective_fps())
+        min_fps = expected_fps * float(config.camera.min_fps_ratio)
+        need_mbps = (
+            float(measured.frame_bytes) * fps / 1e6 * float(config.camera.min_write_headroom)
+        )
+        failures: list[str] = []
+        if fps < min_fps:
+            failures.append(
+                f"帧率不足：实测 {fps:.2f} fps，低于要求的 {min_fps:.2f} fps"
+                f"（期望 {expected_fps:.2f} × {config.camera.min_fps_ratio:.0%}）"
+            )
+        if float(record.dropped_ratio) > float(config.camera.max_dropped_ratio):
+            failures.append(
+                f"掉帧：缺 {record.missing_frames} 帧（{record.dropped_ratio:.2%}），"
+                f"超过上限 {config.camera.max_dropped_ratio:.2%}"
+            )
+        if write_mbps is None or write_mbps < need_mbps:
+            shown = "没量到" if write_mbps is None else f"{write_mbps:.1f} MB/s"
+            failures.append(
+                f"磁盘写入不足：实测写盘 {shown}，低于这台相机需要的 "
+                f"{need_mbps:.1f} MB/s（{width}×{height} 帧 × {fps:.2f} fps × "
+                f"余量 {config.camera.min_write_headroom}）"
+            )
+        ok = not failures
+
+        lines = [
+            f"实际原始分辨率：{width}×{height}（RAW 就按这个尺寸整幅存）",
+            f"实际帧率：{fps:.2f} fps（期望 {expected_fps:.2f}，下限 {min_fps:.2f}）",
+            f"帧号连续性：{record.frame_count} 帧采到、缺 {record.missing_frames} 帧"
+            f"（{record.dropped_ratio:.2%}，上限 {config.camera.max_dropped_ratio:.2%}）"
+            f"，首帧号 {record.first_frame_id}、末帧号 {record.last_frame_id}",
+            f"实际 RAW 字节数：{raw_bytes} 字节（{raw_bytes / 1024**3:.3f} GB，"
+            f"每帧 {measured.frame_bytes} 字节）",
+            f"实际每秒写盘速度："
+            + ("没量到" if write_mbps is None else f"{write_mbps:.1f} MB/s")
+            + f"（这一段真实耗时 {record.wall_seconds:.2f} s；"
+            f"这台相机需要 ≥ {need_mbps:.1f} MB/s）",
+            f"结论：{'通过' if ok else '未通过——' + '；'.join(failures)}",
+        ]
+
+        # 汇总落盘（JSON + 人可读 TXT）。**先写汇总，再决定删不删**：
+        # 万一下面删除出问题，至少这份记录已经在盘上了。
+        summary = {
+            "segment_id": segment_id,
+            "seconds": seconds,
+            "ok": bool(ok),
+            "failures": failures,
+            "lines": lines,
+            "measured": measured.to_dict(),
+            "frames": int(record.frame_count),
+            "first_frame_id": int(record.first_frame_id),
+            "last_frame_id": int(record.last_frame_id),
+            "missing_frames": int(record.missing_frames),
+            "dropped_ratio": float(record.dropped_ratio),
+            "raw_bytes": raw_bytes,
+            "raw_seconds_wall": float(record.wall_seconds),
+            "write_mbps": write_mbps,
+            "expected_fps": expected_fps,
+            "min_fps": min_fps,
+            "min_write_headroom": float(config.camera.min_write_headroom),
+            "need_mbps": need_mbps,
+            "sample_images": [
+                str(path.name) for path in sorted(out_dir.glob("sample_*.png"))
+            ],
+            "raw_deleted": False,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        json_path = out_dir / "connection_check.json"
+        txt_path = out_dir / "connection_check.txt"
+        write_json(json_path, summary)
+        write_text(txt_path, "\n".join(["连接设备后的 5 s 全屏采集检查", *lines]) + "\n")
+
+        # 检查通过 → 删掉这份测试 RAW（只留汇总和样本图）。不通过 → **保留**，
+        # 因为"为什么采成这样"要看原始帧，而且此刻本来就要停下来查原因。
+        if ok and raw_path.is_file():
+            remove_raw_artifacts(raw_path)
+            summary["raw_deleted"] = bool(not raw_path.exists())
+            lines.append(
+                f"测试 RAW 已删除（"
+                f"{'确认不存在' if summary['raw_deleted'] else '**仍然存在，请人工检查**'}），"
+                f"保留汇总 {json_path.name} / {txt_path.name}、样本图与上面五项实测值。"
+            )
+        elif not ok and raw_path.is_file():
+            lines.append(
+                f"检查未通过，**测试 RAW 保留在 {out_dir}** 供排查（"
+                "这里按和分组流水线一样的规矩：校验不过就不删数据）。"
+            )
+        # ★ 删除之后**重写一次**汇总：RAW 已经删了，这份 JSON/TXT 就是现场唯一的
+        # 证据，"删了什么、留了什么、为什么保留"必须写在里面。
+        # 先写这里、再由上面追加那一句的话，落盘的汇总里会缺掉最后这句
+        # （留下 raw_deleted=true 却没有任何文字说明），事后只能靠翻事件流猜。
+        summary["lines"] = list(lines)
+        write_json(json_path, summary)
+        write_text(txt_path, "\n".join(["连接设备后的 5 s 全屏采集检查", *lines]) + "\n")
+
+        for line in lines:
+            self.hooks.log(f"[连接检查] {line}")
+        self.measured = measured
+        self.capture_check = summary
+        self.capture_check_ok = bool(ok)
+        if self.run is not None:
+            self.run.events.write(
+                "connection_check", ok=bool(ok), failures=failures, lines=lines,
+                measured=measured.to_dict(), raw_bytes=raw_bytes,
+                write_mbps=write_mbps, summary=str(json_path),
+            )
+            self.run.note(f"[连接检查] " + "；".join(lines))
+        # 把实测值代进整场规模估算，让人当场看到"按这台机器，这一趟要多久、占多少盘"。
+        for line in planned_scale_lines(config, measured=measured):
+            self.hooks.log(f"[规模] {line}")
+        return summary
+
+    def require_capture_check(self, what: str) -> None:
+        """运动之前的硬闸门：没有通过 5 s 采集检查就**不得动**（需求一·3）。
+
+        为什么是硬闸门而不是"提示一下"：后面每一组的磁盘峰值都是拿这次实测的
+        分辨率和帧率算出来的。没有实测值就开动，等于用配置里的名义尺寸去卡一个
+        可能大得多的真实画面——那正是"跑一半磁盘写满"的成因。
+        """
+        if self.capture_check is None:
+            raise ExperimentError(
+                f"{what}没有开始：还没做连接设备后的 5 s 全屏采集检查。\n"
+                "请先做这一步（它不动机器人），确认这台机器能以全屏 RAW 采得动、"
+                "写得下，再开始运动——后面每一组的磁盘峰值都用这次实测的尺寸和帧率算。"
+            )
+        if not self.capture_check_ok:
+            failures = self.capture_check.get("failures") or ["（未记录原因）"]
+            raise ExperimentError(
+                f"{what}没有开始：5 s 全屏采集检查**未通过**，禁止运动。\n"
+                + "\n".join(f"  · {item}" for item in failures)
+                + "\n先解决上面这一条（帧率/缺帧/写盘三者之一），"
+                "重新做一次连接检查并通过之后再开动。"
+            )
+
+    # ------------------------------------------------------------------
     # ROI / 棋盘格：开始任何一段采集之前的统一检查
     # ------------------------------------------------------------------
 
     def require_roi_and_board(self, what: str, *, require_board: bool = True) -> list[str]:
-        """抓一帧，按**和 RAW 完全相同**的 ROI 检查这件事能不能开始。
+        """抓一帧，按**离线分析真正会看的那一块**检查这件事能不能开始。
 
         检查两件事，任何一件不过就**拒绝开始这一段**（抛 :class:`ExperimentError`）：
 
-        1. ROI 是否越界（``camera.roi`` 的 x+w、y+h 是否落在原始画面内）；
-        2. 裁剪**之后**的图里，棋盘格内角点是否齐全、边缘余量是否够。
+        1. 离线分析 ROI 是否越界（x+w、y+h 是否落在原始画面内）；
+        2. 在**分析窗口**（= 有 ROI 就裁到 ROI，没有就是整幅）里，
+           棋盘格内角点是否齐全、边缘余量是否够。
 
-        第 2 条必须按裁剪后的图判：人在预览里看到的是裁过的图，离线识别处理的
-        也是裁过的图，如果拿未裁剪的整幅图去判"棋盘格完整"，就会出现
-        "检查说没问题、跑起来识别不到角点"。
+        第 2 条必须按分析窗口判：离线识别处理的正是那一块，如果拿整幅去判
+        "棋盘格完整"，就会出现"检查说没问题、跑起来识别不到角点"。
 
-        ``require_board=False`` 只查 ROI（正式实验中途复查用，那时棋盘格必须仍然完整，
-        所以实际上还是 True；留这个参数是为了静态基线之前的检查可以只报不拦）。
+        ★ v1.0.3：这里的结论**和 RAW 没有关系**——RAW 一律整幅保存，
+        棋盘格跑到 ROI 之外时 RAW 里其实还有，只是离线识别看不见它。
+        预览图因此显示**整幅 + ROI 框**，人一眼就能看出"框歪了"。
+
+        ``require_board=False`` 只查 ROI（留这个参数是为了静态基线之前的检查
+        可以只报不拦）。
         """
         if self.engine is None or self.run is None or self.pump is None:
             raise ExperimentError("会话还没打开：请先调用 open()。")
@@ -916,7 +1577,8 @@ class ExperimentSession:
             corners_note, board_ok = self._check_board_frame(cropped)
             config = self.config
             lines.append(
-                f"裁剪后棋盘格检查：{'通过' if board_ok else '未通过'}——{corners_note}"
+                f"分析窗口里的棋盘格检查：{'通过' if board_ok else '未通过'}——"
+                f"{corners_note}"
                 f"（要求内角点 {config.camera.board_inner_corners[0]}×"
                 f"{config.camera.board_inner_corners[1]} 全部检出，"
                 f"余量 ≥ {config.camera.min_margin_px} px）"
@@ -924,10 +1586,10 @@ class ExperimentSession:
         ok = bool(roi_ok and board_ok)
         for line in lines:
             self.hooks.log(f"[ROI] {line}")
-        # ★ 需求三：界面上除了日志里的三个尺寸，还要给出**真实的裁剪后预览**。
-        # 这里落的图就是刚才用来判棋盘格的那张裁剪图，和 RAW 里存的是同一个裁剪，
-        # 所以"界面上看到的" = "检查用的" = "RAW 里有的"。
-        preview_path = self._write_roi_check_preview(cropped, what)
+        # ★ 界面上的预览：**整幅 + 分析 ROI 红框**，和 RAW 里存的一致；
+        # 棋盘格判据走的是框里那一块（离线识别真正会看的），两者刻意分开显示，
+        # 免得"预览通过"被当成"RAW 里棋盘格在框内"。
+        preview_path = self._write_roi_check_preview(frame, cropped, what)
         if preview_path is not None and self.hooks.on_preview is not None:
             self.hooks.on_preview(
                 preview_path,
@@ -942,17 +1604,25 @@ class ExperimentSession:
         if not ok:
             raise ExperimentError(
                 f"{what}没有开始：ROI 或棋盘格检查未通过。\n" + "\n".join(lines)
-                + "\n（ROI 越界请改小/移动 camera.roi；棋盘格不完整请调整相机或棋盘格位置后重试。）"
+                + "\n（ROI 越界请改小/移动 camera.analysis_roi；"
+                "棋盘格不完整请调整相机或棋盘格位置后重试。"
+                "注意：RAW 保存的是整幅，这里卡住的是离线分析窗口。）"
             )
         return lines
 
-    def _write_roi_check_preview(self, cropped: Any, what: str) -> Path | None:
+    def _write_roi_check_preview(
+        self, frame: Any, cropped: Any, what: str
+    ) -> Path | None:
         """把"这次检查到底看了哪块画面"存成一小张 PNG，并回给界面显示。
+
+        ★ v1.0.3：存的是**整幅帧 + 分析 ROI 红框**（``analysis_preview_image``），
+        不是裁过的那块——因为 RAW 存的就是整幅，人要比对的是"RAW 里有什么"
+        和"离线分析只看框里那一块"。棋盘格跑出红框时会一眼看出来。
 
         存图失败（盘满、编码器异常）**不算检查失败**——检查的结论是数值判出来的，
         图只是给人看的佐证；这里如实写一条日志然后继续。
         """
-        if cropped is None or self.run is None:
+        if frame is None or self.run is None:
             return None
         index = len(self.roi_check_previews) + 1
         path = self.run.root / "roi_checks" / f"{index:03d}_{safe_name(what)}.png"
@@ -960,7 +1630,7 @@ class ExperimentSession:
             import cv2
 
             path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(path), np_as_uint8(cropped))
+            cv2.imwrite(str(path), self.analysis_preview_image(frame))
         except Exception as exc:
             self.hooks.log(f"[ROI] 预览图存盘失败（不影响本次检查结论）：{exc}")
             return None
@@ -976,6 +1646,7 @@ class ExperimentSession:
         config = self.config
         if self.run is None or self.robot is None:
             raise ExperimentError("会话还没打开：请先调用 open()。")
+        self.require_capture_check("快速几何检查")
         plan = build_quick_probe_plan(
             config.robot.nominal_joint_deg,
             config.pretest.joints,
@@ -1154,6 +1825,11 @@ class ExperimentSession:
                 config=config,
                 noise_frames=noise_frames,
                 rotation_joint=rotation_joint,
+                # ★ 本段的几何基准是几帧的平均（process_segment 落盘的那一项）。
+                # 它进了可分辨下限的公式：基准帧数变了，同一段数据算出来的
+                # "能不能分辨深度"就变了，所以必须从这一段的真实结果里取，
+                # 不能在估计函数里写一个默认值糊过去。
+                reference_frames=int(segment.reference_frames),
             ),
         )
 
@@ -1317,6 +1993,7 @@ class ExperimentSession:
         config = self.config
         if self.run is None:
             raise ExperimentError("会话还没打开：请先调用 open()。")
+        self.require_capture_check("三档微动预实验")
         plan = build_pretest_plan(config, config.robot.nominal_joint_deg)
         plans = iter_segment_plans(plan)
         statistics = [p for p in plans if p.statistics_event_id]
@@ -1329,13 +2006,23 @@ class ExperimentSession:
         )
         self.hooks.log(result.lines[-1])
         # ★ 需求一：预实验**每个关节一组**。计划本身就是按关节排的（见
-        # joint_space.build_pretest_plan 的循环顺序），所以这里按关节切片即可；
-        # 切片算的是"这一组要录多久、要占多少盘"，用来做分组磁盘闸门。
-        by_joint: dict[Any, list[SegmentPlan]] = {}
-        for item in plans:
-            by_joint.setdefault(item.primary.event.joint, []).append(item)
+        # joint_space.build_pretest_plan 的循环顺序）；分组与磁盘闸门都在
+        # ``plan_pretest_groups`` 里定，**在发任何运动命令之前**算完——
+        # 万一某个关节的一组自己就超过硬上限，那也是在这里就拒绝，
+        # 而不是走到一半才发现放不下。
+        group_plans = plan_pretest_groups(config, plans, measured=self.measured)
+        group_of = {
+            id(segment): item for item in group_plans for segment in item.segments
+        }
+        for item in group_plans:
+            if item.level != "repeat":
+                self.hooks.log(
+                    f"[分组] {item.what}：这个关节的一组按实测尺寸放不下，"
+                    "只在「已经回到名义姿态」的边界上再拆。"
+                )
         triggers = self._joint_triggers(plans)
         active: Any = None
+        active_group: str | None = None
         try:
             for position, segment_plan in enumerate(plans, start=1):
                 self._check_stop()
@@ -1351,12 +2038,13 @@ class ExperimentSession:
                         # 同上：关节级确认就是本关节其余动作的通行证。
                         if joint:
                             self._confirmed.add(joint)
-                    # 换关节 = 换组：上一组在这里收尾（处理→校验→删 RAW），
-                    # 本组再按自己的计划过磁盘闸门。
-                    self.begin_group(
-                        f"预实验 {joint}", by_joint.get(joint, []), what=f"预实验 {joint}"
-                    )
                     active = joint
+                group = group_of[id(segment_plan)]
+                if group.name != active_group:
+                    # 换组（换关节，或同一个关节在名义姿态处再拆出的小段）：
+                    # 上一组在这里收尾（处理→校验→删 RAW），本组再按自己的计划过闸门。
+                    self.begin_group(group.name, group.segments, what=group.what)
+                    active_group = group.name
                 record = self._run_segment(
                     segment_plan, kind="pretest", position=position, total=len(plans)
                 )
@@ -1451,6 +2139,9 @@ class ExperimentSession:
                 "[范围检查] 配置里关掉了 formal.require_range_check；"
                 "本次没有做理论范围检查（碰撞状态仍然是 unknown）。"
             )
+        # ★ 需求一·3：运动之前必须已经做过 5 s 全屏采集检查并通过。
+        # 放在关节循环之外：连一次都没采过就开动，后面每一组的磁盘峰值都没有依据。
+        self.require_capture_check(f"组{group.upper()} 正式实验")
         try:
             for joint in config.pretest.joints:
                 step = steps.get(joint)
@@ -1473,29 +2164,43 @@ class ExperimentSession:
                 ):
                     raise MotionAborted(f"操作者没有确认开始 组{group.upper()} {joint}。")
                 self._confirmed.add(joint)
-                # ★ 需求一：正式实验**"一个关节的组A" 或 "一个关节的组B" 各一组**。
-                # begin_group 会先把上一组收尾（处理→校验→删 RAW），
-                # 再按本组自己的计划过磁盘闸门——正式实验一组就是几十分钟、
-                # 十几 GB，前一组没删干净的时候查磁盘等于没查。
-                self.begin_group(
-                    f"组{group.upper()} {joint}",
+                # ★ 需求一·4：正式实验**每一遍 repeat 单独成组**——不能把
+                # 5 循环 × 2 方向 × 3 遍塞进一组。分组方案在**发任何运动命令之前**
+                # 就定好；要是连最小的一组都放不下，这里就抛错拒绝开始，
+                # 绝不会"先跑起来再说"。
+                group_plans = plan_formal_groups(
+                    config,
                     plans,
-                    what=f"组{group.upper()} {joint} 正式实验",
+                    config.robot.nominal_joint_deg,
+                    group,
+                    joint,
+                    measured=self.measured,
                 )
-                for position, segment_plan in enumerate(plans, start=1):
-                    self._check_stop()
-                    record = self._run_segment(
-                        segment_plan,
-                        kind=f"formal_{group.lower()}",
-                        position=position,
-                        total=len(plans),
+                if group_plans and group_plans[0].level != "repeat":
+                    result.add(
+                        f"⚠ {joint} 的默认分组（每遍一组）放不下，已改在"
+                        "「已回到名义姿态」的边界上再拆细："
+                        + "、".join(item.what for item in group_plans)
+                        + "。动作数量、重复次数和帧率一个都没改。"
                     )
-                    if record is None:
-                        continue
-                    result.segments.append(record)
-                    self._record_trial(segment_plan, record)
-                # 本关节这一组走完，机械臂停在名义位姿，就地处理掉。
-                self.flush_group(reason=f"组{group.upper()} {joint} 动作全部走完")
+                    self.hooks.log(result.lines[-1])
+                for group_index, item in enumerate(group_plans, start=1):
+                    self._check_stop()
+                    self.begin_group(item.name, item.segments, what=item.what)
+                    for position, segment_plan in enumerate(item.segments, start=1):
+                        self._check_stop()
+                        record = self._run_segment(
+                            segment_plan,
+                            kind=f"formal_{group.lower()}",
+                            position=position,
+                            total=len(item.segments),
+                        )
+                        if record is None:
+                            continue
+                        result.segments.append(record)
+                        self._record_trial(segment_plan, record)
+                    # 这一遍走完，机械臂停在名义位姿：就地处理、校验、删 RAW。
+                    self.flush_group(reason=f"{item.what} 动作全部走完，已回到名义姿态")
             result.add(f"组{group.upper()} 采集完成：{len(result.segments)} 段。")
         finally:
             # 同 run_pretest：中途中止也要把已采到的段登记进 trial_plan。
@@ -1900,18 +2605,47 @@ class ExperimentSession:
         )
         results: list[dict[str, Any]] = []
         failures: list[str] = []
+        # ★ 需求一·7：处理期间 RTDE 后台采样**暂停**（顺带刷盘）。
+        # 处理期间机械臂停着不动，继续往里写只会把"处理耗时"混进机器人状态流，
+        # 让第一层"指令 → 实际"凭空多出一段没有动作的时间。
+        # 顺序是"先 flush 再置暂停"，见 RobotStateRecorder.pause 的说明。
+        moved_before = self._moved_event_ids()
+        if self.recorder is not None:
+            self.recorder.pause(reason=f"处理「{group}」")
         # RTDE 状态流每读一次要遍历整个 CSV，所以**一组只读一次**，
         # 给组内每段的校验共用（见 _verify_releasable 的 rtde_rows 参数）。
         rtde_rows = self._load_rtde_rows()
-        for position, record in enumerate(pending, start=1):
-            info = self.process_and_release(record, rtde_rows=rtde_rows)
-            results.append(info)
-            if info.get("kept"):
-                failures.append(f"{record.segment_id}：{info.get('reason', '')}")
-            self.hooks.log(
-                f"[分组] {position}/{len(pending)} {record.segment_id}："
-                + ("已处理并删除 RAW" if info.get("deleted") else str(info.get("reason")))
-            )
+        try:
+            for position, record in enumerate(pending, start=1):
+                info = self.process_and_release(record, rtde_rows=rtde_rows)
+                results.append(info)
+                if info.get("kept"):
+                    failures.append(f"{record.segment_id}：{info.get('reason', '')}")
+                self.hooks.log(
+                    f"[分组] {position}/{len(pending)} {record.segment_id}："
+                    + (
+                        "已处理并删除 RAW"
+                        if info.get("deleted")
+                        else str(info.get("reason"))
+                    )
+                )
+            # ★ 需求一·7 的硬不变量：**处理期间一条运动命令都不许发**。
+            # 这一条不能只靠"代码里没写"，要真的数一数机器人收到过哪些动作。
+            moved_after = self._moved_event_ids()
+            if moved_after != moved_before:
+                extra = sorted(moved_after - moved_before)
+                message = (
+                    f"处理「{group}」期间机器人收到了新的运动命令（{extra}）——"
+                    "这违反了「处理期间不得发送任何机械臂运动命令」这一条。"
+                    "已经中止，请检查代码路径后重新开始。"
+                )
+                self.hooks.log(message)
+                self.abort(message)
+                raise MotionAborted(message)
+        finally:
+            # 无论处理是否顺利，都要把 RTDE 采样恢复回来（否则后面的段一条状态都采不到）。
+            if self.recorder is not None:
+                self.recorder.resume(reason=f"处理「{group}」结束")
         if run is not None:
             released = sum(1 for item in results if item.get("deleted"))
             run.events.write(
@@ -1924,6 +2658,10 @@ class ExperimentSession:
         # 本组到此为止：后面再采到的段属于新的一组，
         # 不能继续挂着上一组的名字（否则日志和事件会串组）。
         self._group_name = None
+        if not failures:
+            # ★ 需求一·7：处理结束、RTDE 已恢复，现在把相机缓冲里的旧帧丢掉，
+            # 重新建立帧号基线，然后才允许开始下一遍 repeat。
+            self._resume_camera_after_processing(group)
         if failures:
             message = (
                 f"「{group}」里有 {len(failures)} 段**校验没通过，RAW 已保留**：\n"
@@ -1936,6 +2674,58 @@ class ExperimentSession:
             self.abort(message)
             raise MotionAborted(message)
         return results
+
+    def _moved_event_ids(self) -> set[str]:
+        """机器人到目前为止**真的动过**的那些动作编号（用来证明处理期间没动）。
+
+        三种机器人实现（真机 / 干运行 / 回放）都提供 ``moved_event_ids()``。
+        没有它就只能在代码里"相信"处理期间没发命令；有了它就能在组边界上
+        前后各取一次快照做差——多出来任何一个编号，就是处理期间发了运动命令。
+        """
+        if self.robot is None:
+            return set()
+        getter = getattr(self.robot, "moved_event_ids", None)
+        if getter is None:  # pragma: no cover - 三种实现都有，缺了就是实现漏了
+            return set()
+        return {str(item) for item in getter()}
+
+    def _resume_camera_after_processing(self, group: str) -> int:
+        """丢掉相机缓冲里的旧帧并重建帧号基线（需求一·7）。返回丢掉的帧数。
+
+        为什么必须做：处理一组要几十秒到几分钟，这段时间没人取帧，缓冲里压着
+        处理期间的旧画面。直接接着取会有两个后果——(1) 下一段的头几帧其实是
+        处理期间的画面，相位边界被顶歪；(2) 这几十秒的帧号跳号会被当成下一段掉帧。
+        丢几帧就都解决了。
+        """
+        if self.engine is None:
+            return 0
+        count = int(self.config.camera.resume_drain_frames)
+        if count <= 0:
+            self.hooks.log(
+                "[分组] camera.resume_drain_frames=0：处理之后不丢帧，"
+                "相机缓冲里的旧帧会直接进入下一段（不推荐）。"
+            )
+            return 0
+        dropped, baseline = self.engine.drain_frames(
+            count, stop_requested=self.hooks.stop_requested
+        )
+        note = (
+            f"[分组]「{group}」处理结束、相机恢复：已丢弃缓冲里的 {dropped} 帧"
+            f"（要求 {count} 帧），新帧号基线 = "
+            + ("未知" if baseline is None else str(baseline))
+            + "。处理期间没有读取的那些帧**不计入**下一段的掉帧。"
+        )
+        self.hooks.log(note)
+        if self.run is not None:
+            self.run.events.write(
+                "camera_resumed",
+                group=group,
+                dropped_frames=int(dropped),
+                requested=int(count),
+                frame_id_baseline=baseline,
+            )
+            self.run.note(note)
+        return dropped
 
     def _load_rtde_rows(self) -> list[dict[str, Any]]:
         """读一次 robot_states.csv，给本组所有段的校验共用。"""
@@ -1951,8 +2741,40 @@ class ExperimentSession:
             return []
 
     def _require_group_disk(self, segments: Sequence[Any], what: str) -> list[str]:
-        """进入下一组之前的磁盘闸门：超硬上限或空间不够就**不得开始**。"""
-        ok, lines = check_group_disk(self.config, segments, what=what)
+        """进入下一组之前的磁盘闸门：超硬上限或空间不够就**不得开始**。
+
+        ★ 需求二：每组开始前必须把这一组的**动作数量、预计录制秒数、预计帧数、
+        预计 RAW 大小、预计峰值、是否低于 40/50 GB、结束后是否自动删 RAW**
+        显示出来。这几行由 :func:`group_forecast` 给出，用的是**实测**分辨率和
+        帧率（``self.measured``）——没做连接检查时退化成配置名义值，但那种情况下
+        :meth:`require_capture_check` 本来就不让运动开始。
+        """
+        forecast = group_forecast(
+            self.config, segments, name=what, measured=self.measured
+        )
+        for line in forecast.lines():
+            self.hooks.log(f"[本组预报] {line}")
+        if self.run is not None:
+            self.run.events.write(
+                "group_forecast",
+                group=self._group_name,
+                what=what,
+                width=forecast.width,
+                height=forecast.height,
+                fps=forecast.fps,
+                action_count=forecast.action_count,
+                seconds=forecast.seconds,
+                frames=forecast.frames,
+                raw_gb=forecast.raw_gb,
+                process_peak_gb=forecast.process_peak_gb,
+                under_warn=bool(forecast.under_warn),
+                under_cap=bool(forecast.under_cap),
+                delete_after=bool(forecast.delete_after),
+                measured_source=forecast.measured_source,
+            )
+        ok, lines = check_group_disk(
+            self.config, segments, what=what, measured=self.measured
+        )
         for line in lines:
             self.hooks.log(f"[磁盘] {line}")
         if self.run is not None:
@@ -1985,8 +2807,25 @@ class ExperimentSession:
         这里把它改成分组流水线：**一组动作全部走完、机械臂停稳之后**，
         整组一起离线识别，角点表和逐帧几何**先落盘并回读校验**，
         确认这一组已经可以复算了，才删除 frames.raw。这样任何一个时刻盘上
-        只有"当前这一组"，而不是整场的总和（800×600 整场约 222 GB、
-        单组峰值约 21 GB；950×800 整场约 352 GB、单组峰值约 34 GB）。
+        只有"当前这一组"，而不是整场的总和。
+
+        ★ **严格的动作顺序**（v1.0.3 需求一·6）——这个顺序本身就是数据安全：
+
+        1. **RAW 还在的时候**逐帧处理完，写 ``segment_vision.json``，
+           此时 JSON 里 ``raw_available=true``（这是实话：RAW 确实还在）；
+        2. 跑完删除前的**六项校验**；
+        3. 校验不过 → **保留 RAW**，JSON 保持 ``true``，注解文字里**绝不出现**
+           "RAW 已删除"，返回 ``kept=True`` 让 ``flush_group`` 停下等人；
+        4. 校验通过 → 才真正删除 RAW；
+        5. **确认 RAW 真的没了**（删除是"调用了"，不等于"删掉了"）；
+        6. 确认之后才原子改写 JSON 为 ``raw_available=false`` 并换成"已删除"的注解。
+
+        为什么第 1 步必须写 ``true``：如果一开始就写 ``false``，那么第 3 步
+        校验失败、RAW 被保留下来时，盘上会出现"RAW 在、JSON 说不在"的矛盾——
+        以后有人据此判断"这段没法重新识别了"，就会白白丢掉还能用的原始像素。
+        反过来，先 ``true`` 后 ``false`` 的话，任何时刻的 JSON 都不会**高估**
+        RAW 的存在性：最坏情况是 RAW 已删而 JSON 还没来得及改成 false，
+        那只是保守（多留一条"也许还能重识别"的念想），不会让人误删数据。
 
         四条不妥协的规矩：
 
@@ -2018,6 +2857,10 @@ class ExperimentSession:
             "raw_bytes": 0,
             "raw_sha256": "",
             "stride": int(config.paths.process_stride),
+            # ★ 逐帧结果写完之后 RAW 还在（true）；只有第 6 步成功改写才变 false。
+            # 这一项如实反映**盘上的事实**，不是"我们打算删"。
+            "raw_available": True,
+            "notes_updated": False,
         }
         if not info["enabled"]:
             return info
@@ -2074,10 +2917,10 @@ class ExperimentSession:
                 metrics_path=run.vision_dir / "metrics.csv",
                 stride=stride,
                 vision_json_path=vision_json,
-                # 这一条路径处理完、校验通过就会删掉 RAW，所以 JSON 里如实写
-                # raw_available=false；离线分析/回放写同一份文件时 RAW 还在，
-                # 那里用默认的 true（见 save_vision_json 的说明）。
-                raw_available_after=False,
+                # ★ 第 1 步：此刻 RAW **还在**，所以如实写 true。
+                # 等到第 6 步确认删干净了，再原子改写成 false（见 save_vision_json）。
+                # 反过来写会让"校验失败、RAW 被保留"的那条路径留下自相矛盾的记录。
+                raw_available_after=True,
             )
         except Exception as exc:
             info["kept"] = True
@@ -2098,23 +2941,57 @@ class ExperimentSession:
             rtde_rows=rtde_rows,
         )
         if not ok:
+            # ★ 第 3 步：校验不过 → 保留 RAW。此刻 JSON 里是 raw_available=true，
+            # 注解文字也不是"已删除"——三件事（RAW 在 / JSON 说在 / 注解没说删）
+            # 互相一致。返回 kept=True，由 flush_group 停下整个会话等人处理。
             info["kept"] = True
             info["reason"] = f"处理结果校验不过，RAW 保留：{why}"
             self._record_release(run, "raw_kept", info)
             self.hooks.log(f"[分组] {record.segment_id}：{info['reason']}")
             return info
 
+        # ★ 第 4 步：校验通过，才真正删除。
         remove_raw_artifacts(raw_path)
+        # ★ 第 5 步：确认它**真的**没了。"调用过删除"和"文件没了"是两件事——
+        # 句柄被占用、杀软扫描、网络盘延迟都会让 unlink 看似成功而文件还在。
+        # 没有确认就改写 JSON，等于拿一句没验证的话去换掉一句实话。
+        if raw_path.exists():
+            info["kept"] = True
+            info["reason"] = (
+                "删除 frames.raw 之后文件**仍然存在**（可能被其它进程占用）："
+                "不敢改写逐帧结果的 RAW 状态，JSON 保持 raw_available=true，RAW 保留。"
+            )
+            self._record_release(run, "raw_kept", info)
+            self.hooks.log(f"[分组] {record.segment_id}：{info['reason']}")
+            return info
         info["deleted"] = True
         info["corners"] = str(corners_path)
         info["vision_json"] = str(vision_json)
         info["valid_frames"] = int(processed.valid_count)
         info["processed_frames"] = int(processed.frame_count)
         info["valid_ratio"] = float(processed.valid_ratio)
+        info["raw_available"] = False
+        # ★ 第 6 步：原子改写 JSON 为 raw_available=false 并换成"已删除"的注解。
+        try:
+            save_vision_json(vision_json, processed, stride=stride, raw_available=False)
+            info["notes_updated"] = True
+        except Exception as exc:
+            # RAW 确实删了，但 JSON 还写着 true。这是**唯一**允许出现
+            # "JSON 说 RAW 在、实际不在"的场合，而且方向是保守的
+            # （不会让人误以为还能重识别而删掉别的东西）。必须响亮地报出来，
+            # 让人手工把这一段的 raw_available 改成 false，不能默默算了。
+            info["reason"] = (
+                f"RAW 已删除，但改写逐帧结果的 RAW 状态失败（{exc}）："
+                f"{vision_json.name} 里仍写着 raw_available=true，请人工改成 false。"
+            )
+            self._record_release(run, "raw_deleted_note_stale", info)
+            self.hooks.log(f"[分组] {record.segment_id}：{info['reason']}")
+            return info
         self._record_release(run, "raw_deleted", info)
         self.hooks.log(
             f"[分组] {record.segment_id}：已删除原始帧（释放 "
-            f"{info['raw_bytes'] / 1024**3:.3f} GB）。"
+            f"{info['raw_bytes'] / 1024**3:.3f} GB），"
+            f"并确认 frames.raw 不存在、逐帧结果已改为 raw_available=false。"
             f"逐帧角点、质心、二维转角、尺度、时间戳留在 "
             f"{vision_json.name}、{corners_path.name}（步长 {stride}，"
             f"有效帧比例 {info['valid_ratio']:.1%}）；"

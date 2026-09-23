@@ -74,12 +74,29 @@ def build_config(
     # 到位只用 2 个中间点：点数是流程参数，不是判据。
     config.robot.approach_points = 2
 
+    # 连上设备后那次全屏采集检查：交付默认 5.0 s，自测取**配置允许的最短值** 1.0 s
+    # （``camera.connection_check_s`` 的校验下限就是 1 s，再短会被 ``validate`` 拦下）。
+    # 同样是**规模**选择——它只决定"采多少帧"，不决定任何判据：
+    # 帧率下限比例（min_fps_ratio）、缺帧上限（max_dropped_ratio）、写盘余量
+    # （min_write_headroom）一个都没动，检查本身也照常真跑（真采、真算、真落盘、
+    # 真删）。"交付默认是 5.0 s" 由 test_defaults.py 直接盯住配置类和交付 JSON。
+    config.camera.connection_check_s = 1.0
+
     config.pretest.joints = list(joints)
     config.pretest.amplitudes_deg = list(amplitudes)
     config.pretest.repeats_per_direction = int(repeats)
     config.formal.staircase_n = 2
     config.formal.repeats = 1
     config.formal.step_deg = {joint: 0.2 for joint in joints}
+
+    # ★ 分组流水线（采完一组就处理、校验、删 RAW）在**交付默认里是开的**，
+    # 自测里显式关掉——这是**规模**选择，不是放宽判据：开着它意味着每一段都要按
+    # stride=1 把每一帧重新识别一遍（实测一段约 10 s），十来段的流程自测会从
+    # 七分钟涨到一小时以上。打开时的行为由 test_rolling_delete、
+    # test_group_pipeline、test_raw_status_order 用**显式打开**的配置覆盖；
+    # "交付默认就是 true" 由 test_defaults.py 直接盯住配置类和交付 JSON。
+    # 想跑打开的那条路径，照常传 paths__delete_raw_after_process=True 覆盖即可。
+    config.paths.delete_raw_after_process = False
 
     for path, value in overrides.items():
         target: Any = config

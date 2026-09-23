@@ -467,6 +467,13 @@ class FramePump:
     """
 
     def __init__(self, source: Any) -> None:
+        # ★ v1.0.3：**留下原始来源对象**。三种来源（真机 / 合成 / 回放）的
+        # ``__iter__`` 都是生成器函数，所以 ``iter(来源)`` 拿到的是一个生成器——
+        # 帧率（``actual_camera_fps``）和上下文管理（``__exit__``）都在**来源**
+        # 身上，生成器上一个都没有。只留迭代器就会把这两样一起丢掉，
+        # 而丢掉的后果不是"少个字段"，是采集层把**期望帧率**当成**实测帧率**用
+        # （见下面两个属性的说明）。
+        self._origin = source
         self.source = source if hasattr(source, "__next__") else iter(source)
         self._pending: Any = None
         self.read_count = 0
@@ -508,9 +515,51 @@ class FramePump:
             raise SourceError("抽帧时一帧都没读到，图像来源可能已经结束或相机掉线。")
         return last
 
+    @property
+    def actual_camera_fps(self) -> float | None:
+        """★ v1.0.3：把**来源实测**的帧率透出去。
+
+        为什么必须透：采集层拿这个值干两件事——写进采集元数据、
+        以及当"实际帧率"去核对帧时间戳与帧号的对应关系
+        （见 :func:`vendor.camera._enrich_capture_timestamps`）。
+        而这一层包装（本类）曾经把它挡住：``CaptureEngine`` 拿到的是**本对象**，
+        ``getattr(本对象, "actual_camera_fps", None)`` 取不到就回退到
+        ``config.effective_fps()``——也就是**配置里的期望帧率**。
+        后果不是"少个字段"，而是：
+
+        * 需求一·3 的 5 s 全屏采集检查里，"实际帧率"会变成"期望帧率"，
+          一台真的只跑 90 fps 的相机会被报成 132.23 fps 并**判为通过**——
+          检查因此形同虚设（阈值是期望值的 95%，自己比自己永远过）；
+        * 时间轴核对也会拿错帧率去比对。
+
+        真机上相机的实测帧率来自 GenICam 的 ``ResultingFrameRate`` 等节点
+        （见 ``vendor.camera.HikCameraSource._refresh_actual_camera_fps``），
+        它每帧刷新；这里每次都转发现读，不做缓存。
+        """
+        return getattr(self._origin, "actual_camera_fps", None)
+
+    @property
+    def actual_camera_fps_source(self) -> str:
+        """帧率的出处（GenICam 节点名 / 合成世界 / 配置回退），同样转发给来源。"""
+        return str(
+            getattr(
+                self._origin, "actual_camera_fps_source", "config.EXPECTED_VISION_FPS"
+            )
+        )
+
     def close(self) -> None:
+        """关掉来源（真机上就是释放相机句柄）。
+
+        必须对**来源对象**调 ``__exit__``：迭代器（生成器）上没有它，
+        以前写在 ``self.source`` 上会静默失败——真机上相机就悬着没释放。
+        """
+        closer = getattr(self._origin, "__exit__", None)
+        if closer is None:
+            closer = getattr(self.source, "__exit__", None)
+        if closer is None:
+            return
         try:
-            self.source.__exit__(None, None, None)
+            closer(None, None, None)
         except Exception:
             pass
 

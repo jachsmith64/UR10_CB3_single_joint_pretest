@@ -105,6 +105,23 @@ def _as_str(value: Any, where: str) -> str:
     return value
 
 
+def _validate_roi_field(value: Any, where: str) -> list[int]:
+    """校验一个 [x, y, w, h] 形式的 ROI 字段（越界不在这里查，那时才知道帧尺寸）。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ConfigError(
+            f"{where} 必须是 [x, y, w, h] 四个整数，或 null 表示不裁剪，收到 {value!r}"
+        )
+    out: list[int] = []
+    for position, item in enumerate(value):
+        number = _as_int(item, f"{where}[{position}]")
+        if number < 0:
+            raise ConfigError(f"{where}[{position}] 不能为负，收到 {number}")
+        out.append(number)
+    if out[2] <= 0 or out[3] <= 0:
+        raise ConfigError(f"{where} 的宽和高必须为正，收到 {value!r}")
+    return out
+
+
 def _joint_list(value: Any, where: str) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) != 6:
         raise ConfigError(f"{where} 必须是 6 个数字的列表，收到 {value!r}")
@@ -280,10 +297,50 @@ class CameraConfig:
     #: 这是整套预实验里**最有信息量**的一段（稳定值 + 残余振动），
     #: 所以给到 1.5 s ≈ 200 帧；嫌数据大可以在界面上调小。
     hold_s: float = 1.5
-    #: 裁剪区域 (x, y, w, h)，None = 不裁剪。
-    #: ★ 现场建议填一个包住棋盘格的区域：分辨率是磁盘占用的第一主导项，
-    #: 1936×1096 全画幅在 132 fps 下约 280 MB/s，裁到 800×600 只剩约 48 MB/s。
+    #: ★ 离线分析用的 ROI：(x, y, w, h)，原图像素坐标；None = 用整幅分析。
+    #:
+    #: ★★ v1.0.3 起它的语义**只有一条**：**离线识别时在裁出来的这一块里找棋盘格**，
+    #: 角点坐标会加回 ROI 偏移，所以对外（角点 CSV、质心、逐帧几何）始终是
+    #: **原图坐标**。它**不影响 frames.raw 的大小**——RAW 永远逐帧保存整幅原始帧。
+    #:
+    #: 为什么要这么分：裁 RAW 换来的是磁盘和读写速度，代价是"这一块之外的画面
+    #: 永久没有了"。棋盘格一旦因为碰撞、松动或者机械臂挪动而跑出那一块，
+    #: 现场就再也查不出原因。所以 RAW 一律整幅存，ROI 只在**机器人停住之后**的
+    #: 离线分析里用来减少背景干扰、加快识别。
+    #:
+    #: 现场建议填一个包住棋盘格的区域（不是必需）：它只影响分析速度。
+    analysis_roi: list[int] | None = None
+    #: 兼容旧配置：v1.0.2 及以前的 ``camera.roi`` 会被当作**离线分析 ROI** 迁移到
+    #: ``analysis_roi``（见 :meth:`__post_init__`）。新配置请直接写 ``analysis_roi``；
+    #: 这个字段留着只是为了让旧配置文件还能读进来。
+    #: ★ 它**不会**再让 RAW 变成裁过的图——那是 v1.0.2 的行为，已经改掉。
     roi: list[int] | None = None
+
+    #: 传感器满幅尺寸（像素）。只用来估**全屏 RAW** 的磁盘占用与帧字节数，
+    #: 现场不用改；相机换型时改这里。默认是 MV-CS028-10UM 的 1936×1096。
+    #: ★ 磁盘估算**不得**用分析 ROI 的尺寸（那会低估几十倍）。
+    sensor_width: int = 1936
+    sensor_height: int = 1096
+
+    #: 连上设备后那次 5 s 全屏采集检查的时长（秒）。
+    #: ★ 需求写死 5 s；这里做成可配置只为让自测能在不改代码的前提下缩短它，
+    #: 真机一律 5.0。它不是"最短时长"：检查就采这么久。
+    connection_check_s: float = 5.0
+    #: ★ 实际帧率下限比例：实测帧率低于 ``expected_fps × 这个比例`` 就**拒绝开始任何运动**。
+    #: 默认 0.95（期望帧率的 95%）。现场可改；不硬编码在业务逻辑里。
+    min_fps_ratio: float = 0.95
+    #: ★ 写盘速度余量：实测写盘速度必须 ≥ ``帧字节数 × 实测帧率 × 这个系数``。
+    #: 1.2 = 至少留 20% 余量。为什么用"实测"而不是一个固定的 MB/s 常量：
+    #: 够不够取决于**这台相机每秒要灌多少字节**（1936×1096@132 fps ≈ 280 MB/s，
+    #: 340×260@132 fps ≈ 12 MB/s），拿一个写死的 MB/s 当门槛，换个分辨率就完全不对。
+    #: 现场可改；和 ``min_fps_ratio`` 一样不硬编码在业务逻辑里。
+    min_write_headroom: float = 1.2
+    #: ★ 每处理完一组、恢复采集之前，先丢弃相机缓冲里的若干帧（v1.0.3 需求一.7）。
+    #: 处理期间没人从相机取帧，SDK 的缓冲里会压着这段时间的旧帧；重新开录时
+    #: 如果直接接着取，下一段头几帧拿到的是**处理期间**的画面（机器人那时还没动），
+    #: 相位边界就会被这几帧顶歪。丢几帧很便宜（132 fps 下 5 帧约 38 ms），
+    #: 比让一整段的时间轴歪掉划算得多。0 = 不丢（不推荐）。
+    resume_drain_frames: int = 5
 
     #: 是否保存原始帧（流式写 frames.raw）。
     save_raw: bool = True
@@ -295,6 +352,62 @@ class CameraConfig:
     min_margin_px: int = 40
     #: 丢帧比例上限，超过就报警。
     max_dropped_ratio: float = 0.02
+
+    def __post_init__(self) -> None:
+        """把旧配置里的 ``roi`` 迁移成 ``analysis_roi``（v1.0.3）。
+
+        迁移规则只有一条：**旧字段只当"离线分析 ROI"用**，不再裁 RAW。
+        """
+        if self.roi is None:
+            return
+        legacy = [int(value) for value in self.roi]
+        if self.analysis_roi is None:
+            self.analysis_roi = legacy
+
+    def roi_conflict(self) -> str:
+        """两个 ROI 字段都写了而且不一致时的中文说明；一致或只写一个就返回空串。
+
+        ★ 不一致要**报错**而不是悄悄挑一个：现场最有价值的排查线索就是
+        "我以为它按 roi 分析，其实按 analysis_roi 分析"这种不一致。
+        两个字段都在 ``validate`` 里查，所以 ``__post_init__`` 之后再被赋值
+        （界面参数面板就是 ``setattr``）也一样会被抓住。
+        """
+        if self.roi is None or self.analysis_roi is None:
+            return ""
+        legacy = [int(value) for value in self.roi]
+        current = [int(value) for value in self.analysis_roi]
+        if legacy == current:
+            return ""
+        return (
+            f"camera.roi={legacy} 与 camera.analysis_roi={current} 不一致。"
+            "camera.roi 是 v1.0.2 及以前的旧字段，现在只作为 analysis_roi 的"
+            "兼容写法；两个都写又不一致时无法判断以哪个为准，请只保留 "
+            "analysis_roi（它只影响离线分析，不影响 RAW 尺寸）。"
+        )
+
+    def resolved_analysis_roi(self) -> tuple[int, int, int, int] | None:
+        """离线分析实际生效的 ROI（原图坐标）；None = 整幅分析。
+
+        ★ 这里对 ``roi`` 做了兜底：界面上的参数面板是"构造完再 setattr"的，
+        ``__post_init__`` 那时候还没跑。少了这个兜底，人在界面上把 camera.roi
+        填进去、程序却当没看见，ROI 就会**静默失效**。
+        """
+        roi = self.analysis_roi or self.roi
+        if not roi:
+            return None
+        x, y, width, height = (int(value) for value in roi)
+        return x, y, width, height
+
+    def roi_migration_note(self) -> str:
+        """旧字段被迁移过就说一句，没迁移返回空串（界面/日志用它提醒一次）。"""
+        if self.roi is None:
+            return ""
+        roi = self.analysis_roi or self.roi
+        return (
+            f"配置里写的是旧字段 camera.roi={list(self.roi)}，已按兼容规则当作"
+            f"**离线分析 ROI** 使用（analysis_roi={list(roi)}）。"
+            "它不再影响 frames.raw 的大小：RAW 一律整幅保存。"
+        )
 
     def validate(self) -> None:
         where = "camera"
@@ -343,17 +456,39 @@ class CameraConfig:
                 _as_float(getattr(self, name), f"{where}.{name}"), f"{where}.{name}"
             )
         if self.roi is not None:
-            if not isinstance(self.roi, (list, tuple)) or len(self.roi) != 4:
-                raise ConfigError(
-                    f"{where}.roi 必须是 [x, y, w, h] 四个整数，或 null 表示不裁剪，"
-                    f"收到 {self.roi!r}"
-                )
-            for position, value in enumerate(self.roi):
-                number = _as_int(value, f"{where}.roi[{position}]")
-                if number < 0:
-                    raise ConfigError(f"{where}.roi[{position}] 不能为负，收到 {number}")
-            if int(self.roi[2]) <= 0 or int(self.roi[3]) <= 0:
-                raise ConfigError(f"{where}.roi 的宽和高必须为正，收到 {self.roi!r}")
+            conflict = self.roi_conflict()
+            if conflict:
+                raise ConfigError(conflict)
+            _validate_roi_field(self.roi, f"{where}.roi")
+        if self.analysis_roi is not None:
+            _validate_roi_field(self.analysis_roi, f"{where}.analysis_roi")
+        for name in ("sensor_width", "sensor_height"):
+            value = _as_int(getattr(self, name), f"{where}.{name}")
+            if value <= 0:
+                raise ConfigError(f"{where}.{name} 必须为正，收到 {value}")
+        check_s = _as_float(self.connection_check_s, f"{where}.connection_check_s")
+        if not 1.0 <= check_s <= 60.0:
+            raise ConfigError(
+                f"{where}.connection_check_s = {check_s} 超出 1～60 s。"
+                "需求要求连上设备后做 5 s 全屏采集检查，默认就是 5.0。"
+            )
+        ratio_min = _as_float(self.min_fps_ratio, f"{where}.min_fps_ratio")
+        if not 0.0 < ratio_min <= 1.0:
+            raise ConfigError(
+                f"{where}.min_fps_ratio 必须在 0～1 之间（默认 0.95 = 期望帧率的 95%），"
+                f"收到 {ratio_min}"
+            )
+        headroom = _as_float(self.min_write_headroom, f"{where}.min_write_headroom")
+        if headroom <= 0.0:
+            raise ConfigError(
+                f"{where}.min_write_headroom 必须大于 0（默认 1.2 = 至少 20% 余量），"
+                f"收到 {headroom}"
+            )
+        drain = _as_int(self.resume_drain_frames, f"{where}.resume_drain_frames")
+        if not 0 <= drain <= 600:
+            raise ConfigError(
+                f"{where}.resume_drain_frames 必须在 0～600 帧之间（默认 5），收到 {drain}"
+            )
         if not _as_bool(self.save_raw, f"{where}.save_raw"):
             # 需求六要求原始帧必须完整保存（RAW 或经过验证的无损视频）。
             # 关掉它就没有可供离线识别和复核的数据了，所以这里直接拒绝。
@@ -685,14 +820,17 @@ class PathConfig:
     #: 把这一组**整组**处理掉，角点表与逐帧几何**先落盘并校验**，
     #: 校验通过才删掉这一组的 frames.raw，然后才进入下一组运动。
     #: 目的：让盘上任何时刻只有"当前这一组"的几十 GB 原始视频，
-    #: 而不是整场几百 GB（整场 800×600 约 222 GB，950×800 约 352 GB）。
+    #: 而不是整场几百 GB。
     #:
-    #: 默认 False（保持"原始数据一律留盘"的交付行为）。
+    #: ★ v1.0.3 起默认 **True**（现场要求：每采完一个动作组就停机械臂、离线处理、
+    #: 校验、删掉这一组的 RAW，再继续下一组）。默认打开**不等于**放松数据安全：
+    #: 删除前那六项校验一条都没少，校验不过一律保留 RAW 并暂停等人处理。
+    #:
     #: 打开它换来的代价必须说清楚：RAW 删掉之后**只能**用保存下来的角点复算，
     #: 不能再换一套角点检测参数重跑识别；所以每段都会写一条 raw_deleted 事件，
     #: 记下删除的大小、帧数和 sha256，事后能证明"这一段处理过什么、删了什么"。
     #: 处理失败或校验不过时**不删**，宁可占盘，并且**暂停**等人处理。
-    delete_raw_after_process: bool = False
+    delete_raw_after_process: bool = True
     #: 就地处理这一遍的抽帧步长（1 = 每帧都识别）。
     #:
     #: ★ 默认 **1**：删 RAW 之前必须按 132 Hz 把**每一帧**的角点和视觉结果算出来并落盘。
@@ -1059,17 +1197,28 @@ class AppConfig:
             durations.update(self.dry_run.duration_overrides)
         return durations
 
-    def effective_camera_size(self) -> tuple[int, int]:
-        """当前模式下每帧的宽高（像素）。用于磁盘估算。"""
+    def effective_camera_size(
+        self, measured: "MeasuredCapture | None" = None
+    ) -> tuple[int, int]:
+        """每帧的宽高（像素）。**全屏口径**——离线分析 ROI 不算在里面。
+
+        ★ v1.0.3 起 RAW 一律整幅保存，所以磁盘估算必须按**整幅**算。
+        以前这里优先返回 ROI 的宽高（把 RAW 当成裁过的图），在"RAW 整幅、ROI 只做
+        离线分析"的口径下会**低估几十倍**，正是需求要修的那类错误。
+
+        ``measured`` 是连上设备后那次 5 s 全屏采集检查**实测**到的尺寸：
+        给了就用实测值，比配置里的期望值可信。
+        """
+        if measured is not None and measured.width > 0 and measured.height > 0:
+            return int(measured.width), int(measured.height)
         if self.mode == "dry_run":
             return int(self.dry_run.width), int(self.dry_run.height)
-        roi = self.camera.roi
-        if roi:
-            return int(roi[2]), int(roi[3])
-        # 没有 ROI 时按传感器满幅估（MV-CS028-10UM 是 1936×1096）。
-        return 1936, 1096
+        return int(self.camera.sensor_width), int(self.camera.sensor_height)
 
-    def effective_fps(self) -> float:
+    def effective_fps(self, measured: "MeasuredCapture | None" = None) -> float:
+        """生效帧率：有实测就用实测（5 s 检查的结果），否则用配置里的期望值。"""
+        if measured is not None and measured.fps and measured.fps > 0:
+            return float(measured.fps)
         if self.mode == "dry_run":
             return float(self.dry_run.fps)
         return float(self.camera.expected_fps)
@@ -1156,104 +1305,300 @@ def trapezoid_seconds(distance_deg: float, speed_deg_s: float, accel_deg_s2: flo
 _FORMAL_STAGES = ("formal_a", "formal_b")
 
 
-def estimate_capture_seconds(config: AppConfig, plans: Iterable[Any]) -> float:
-    """估算这些计划一共要录制多少秒（用来算磁盘占用）。
+@dataclass(frozen=True)
+class MeasuredCapture:
+    """连上设备后那次 5 s 全屏采集检查**实测**到的东西（需求一.3）。
 
-    规则：一个"去程 + 回程"算作一次试验，录一段连续的：运动前静止 → 去程 →
-    保持 → 回程 → 运动后记录。纯等待步（组间等待）不录制。
+    为什么做成一个对象而不是几个散参数：分辨率、帧率、帧字节数、写盘速度
+    必须来自**同一次实测**。散着传迟早有人把"实测分辨率"和"期望帧率"拼在一起用，
+    那正是"用分析 ROI 估全屏 RAW"这类错误的另一个变种。
     """
-    durations = config.effective_durations()
-    total = 0.0
-    for plan in plans:
-        steps = list(getattr(plan, "steps", plan))
-        stage = next(
-            (str(step.event.stage) for step in steps if step.is_motion), None
-        )
-        speed, accel = config.effective_speed(formal=stage in _FORMAL_STAGES)
-        index = 0
-        while index < len(steps):
-            step = steps[index]
-            if not step.is_motion:
-                # 纯等待：不做视觉记录。
-                index += 1
-                continue
-            if step.event.role != "move":
-                # 单独出现的回程（理论上不会，防御一下）。
-                delta = _step_delta(step)
-                total += trapezoid_seconds(delta, speed, accel) + step.hold_s
-                index += 1
-                continue
-            total += durations["pre_motion"]
-            total += trapezoid_seconds(_step_delta(step), speed, accel)
-            total += float(step.hold_s)
-            next_step = steps[index + 1] if index + 1 < len(steps) else None
+
+    width: int
+    height: int
+    fps: float
+    frames: int = 0
+    seconds: float = 0.0
+    dropped_ratio: float = 0.0
+    missing_frames: int = 0
+    #: 实测每秒写盘量（MB/s）。None = 这一次没量到。
+    write_mbps: float | None = None
+    #: 这些数是哪来的（"5 s 全屏采集检查"），写进报告，避免以后当成配置值。
+    source: str = ""
+
+    @property
+    def frame_bytes(self) -> int:
+        return int(self.width) * int(self.height)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "width": int(self.width),
+            "height": int(self.height),
+            "fps": float(self.fps),
+            "frames": int(self.frames),
+            "seconds": float(self.seconds),
+            "dropped_ratio": float(self.dropped_ratio),
+            "missing_frames": int(self.missing_frames),
+            "frame_bytes": self.frame_bytes,
+            "write_mbps": None if self.write_mbps is None else float(self.write_mbps),
+            "source": self.source,
+        }
+
+
+#: ``ROLE_RETURN`` 的字面量。config 不 import joint_space（joint_space 反过来要
+#: import config），所以这里用字面量 —— 两边一旦不一致，``test_estimates`` 里
+#: "估算的段 == 真跑的段"那条断言会立刻炸。
+ROLE_RETURN = "return"
+#: 同上：``joint_space.ROLE_WAIT`` 的字面量。组间等待是**纯等待**，
+#: 采集层一帧都不写盘（``_run_segment`` 遇到它就只按帧时间推进）。
+ROLE_WAIT = "wait"
+
+
+def segment_step_groups(steps: Sequence[Any]) -> list[list[Any]]:
+    """把一个计划的步序列切成"一次采集一段"。
+
+    ★ 这是**唯一**的切分规则，``experiment.iter_segment_plans`` 也调它。
+    规则：一步之后如果紧跟一个"回到名义位姿"的收尾步（``role == "return"`` 且
+    ``expected_delta_deg == 0.0``），就把它并进同一段——分析要看的正是
+    "去程走了多少、回程回到哪里"，这两件事必须在同一段画面里。
+    组 A 的阶梯回程**不是**这种收尾步（它降到第 k−1 级，不是回名义），
+    所以各自成段。
+
+    两处各写一份规则的后果是"估算按一种切法、真跑按另一种切法"：
+    界面上报的段数、磁盘占用会与实际落盘的段数不符。所以必须只有一份实现。
+    """
+    steps = list(steps)
+    consumed: set[int] = set()
+    groups: list[list[Any]] = []
+    for index, step in enumerate(steps):
+        if index in consumed:
+            continue
+        if getattr(step, "target_joint_deg", None) is None:
+            groups.append([step])
+            continue
+        group = [step]
+        if index + 1 < len(steps):
+            candidate = steps[index + 1]
             if (
-                next_step is not None
-                and next_step.event.role == "return"
-                and next_step.is_motion
+                getattr(candidate, "target_joint_deg", None) is not None
+                and candidate.event.role == ROLE_RETURN
+                and candidate.event.expected_delta_deg == 0.0
             ):
-                total += trapezoid_seconds(_step_delta(next_step), speed, accel)
-                total += float(next_step.hold_s)
-                index += 2
-            else:
-                index += 1
-            total += durations["post_motion"]
-        if not any(step.is_motion for step in steps):
-            # 纯静态计划：只录静态那一段。
-            total += sum(float(step.hold_s) for step in steps)
-    return total
+                group.append(candidate)
+                consumed.add(index + 1)
+        groups.append(group)
+    return groups
 
 
-def _step_delta(step: Any) -> float:
-    event = step.event
-    if event.expected_delta_deg is not None:
-        return abs(float(event.expected_delta_deg))
-    if event.amplitude_deg:
-        return abs(float(event.amplitude_deg))
-    target = step.target_joint_deg
-    if target is None:
+def motion_amount_deg(
+    previous_target: Sequence[float] | None,
+    target: Sequence[float] | None,
+) -> float:
+    """本次**实际运动量**（度）：``本次目标关节角 − 上一次目标关节角``。
+
+    ★ 这是需求一.5 的核心修正点。以前的估算拿 ``event.expected_delta_deg``
+    （相对**名义位姿**的偏移量）当运动量，于是：
+
+    * 组 A 第 3 级阶梯：目标是"名义 + 3Δ"，但机械臂其实只从"名义 + 2Δ"
+      走到"名义 + 3Δ"，真实运动量是 **Δ**。按 3Δ 算，时长和磁盘都被**高估**；
+    * 组 B 的回程：目标是名义位姿（``expected_delta_deg == 0.0``），但机械臂
+      其实从"名义 ± Δ"走回名义，真实运动量是 **Δ**。按 0 算，**低估**。
+
+    两者都在同一套"上一次目标姿态"的时间序里自然消掉：只要按顺序维护
+    "上一次目标关节角"，每一步的运动量就是相邻两个目标的差。
+    """
+    if previous_target is None or target is None:
         return 0.0
+    return max(
+        (abs(float(b) - float(a)) for a, b in zip(previous_target, target)),
+        default=0.0,
+    )
+
+
+def _step_nominal_fallback(step: Any) -> float:
+    """没有上一步目标时（整段的第一个动作）的退路：用相对名义位姿的偏移量。
+
+    各组的第一段都从名义位姿出发，所以"相对名义的偏移"此时**恰好**等于
+    "从上一个目标走过来的距离"。它只作为第一段的退路；一旦走起来，
+    后面每一步都用 :func:`motion_amount_deg` 的真实差分。
+    """
+    event = getattr(step, "event", None)
+    if event is not None and event.expected_delta_deg is not None:
+        return abs(float(event.expected_delta_deg))
+    if event is not None and event.amplitude_deg:
+        return abs(float(event.amplitude_deg))
     return 0.0
 
 
-def estimate_disk_gb(config: AppConfig, capture_seconds: float) -> float:
-    """Mono8 RAW 会占多少 GB。**不含**离线角点结果和样本图（那些很小）。"""
-    width, height = config.effective_camera_size()
-    fps = config.effective_fps()
+def estimate_capture_seconds(
+    config: AppConfig, plans: Iterable[Any], *, measured: "MeasuredCapture | None" = None
+) -> float:
+    """估算这些计划一共要**录制**多少秒（用来算磁盘占用）。
+
+    ★ 一条一条说清楚（需求一.5 列的就是这些）：
+
+    * 每一**段采集**的 RAW 录制时间 =
+      ``pre_motion`` + 去程梯形时间 + ``robot.settle_hold_s`` + 保持时间
+      + （有收尾回程时）回程梯形时间 + ``settle_hold_s`` + 回程保持 + ``post_motion``；
+    * **回程也算**：回程是一次真实运动，它有运动时间，也一直在录；
+    * **相邻阶梯 / 正负换向**都用相邻两个目标角的差来算（见
+      :func:`motion_amount_deg`），不是"相对名义的偏移"；
+    * ``robot.settle_hold_s`` 是采集层的"停稳判据"要求关节在容差内**持续**
+      这么久，所以每个运动相位至少多出这么多时间，估算必须算进去；
+    * **纯等待步骤**（组间等待，``target_joint_deg is None``）**不写 RAW**，
+      所以一秒都不计入录制时间——哪怕它真的要等 3 秒。
+    """
+    durations = config.effective_durations()
+    pre_s = float(durations["pre_motion"])
+    post_s = float(durations["post_motion"])
+    dry_run = config.mode == "dry_run"
+    settle_hold = float(config.robot.settle_hold_s)
+    # ★ "上一次目标关节角"跨段、跨计划一路带下去：组的边界和遍的边界都在
+    #   名义位姿上，所以带着走不会串味，反而正是需求要的"按时间顺序"。
+    previous: tuple[float, ...] | None = None
+    total = 0.0
+
+    for plan in plans:
+        steps = list(getattr(plan, "steps", plan))
+        if not steps:
+            continue
+        stage = next((str(step.event.stage) for step in steps if step.is_motion), None)
+        speed, accel = config.effective_speed(formal=stage in _FORMAL_STAGES)
+        if not any(step.is_motion for step in steps):
+            # 没有任何运动步的段：只有"静态保持"这一类会真的写 RAW
+            # （静态基线就是这么录的）；组间等待（role=wait）**一帧都不写盘**，
+            # 所以一秒都不许算进 RAW 录制时间——需求一.5 点名了这一条。
+            total += sum(
+                float(step.hold_s)
+                for step in steps
+                if str(step.event.role) != ROLE_WAIT
+            )
+            continue
+        for group in segment_step_groups(steps):
+            primary = group[0]
+            follow = group[1] if len(group) > 1 else None
+            if getattr(primary, "target_joint_deg", None) is None:
+                # 纯等待步：不写 RAW，不计录制时间。
+                continue
+            target = tuple(float(v) for v in primary.target_joint_deg)
+            amount = (
+                motion_amount_deg(previous, target)
+                if previous is not None
+                else _step_nominal_fallback(primary)
+            )
+            total += pre_s
+            total += trapezoid_seconds(amount, speed, accel) + settle_hold
+            total += float(durations["hold"] if dry_run else primary.hold_s)
+            previous = target
+            if follow is not None:
+                return_target = tuple(float(v) for v in follow.target_joint_deg)
+                back = motion_amount_deg(previous, return_target)
+                total += trapezoid_seconds(back, speed, accel) + settle_hold
+                total += float(durations["hold"] if dry_run else follow.hold_s)
+                previous = return_target
+                total += post_s
+    return total
+
+
+def count_recording_segments(plans: Iterable[Any]) -> int:
+    """这些计划里**真正会落盘**的采集段数（纯等待步不算）。"""
+    total = 0
+    for plan in plans:
+        for group in segment_step_groups(list(getattr(plan, "steps", plan))):
+            if getattr(group[0], "target_joint_deg", None) is not None:
+                total += 1
+    return total
+
+
+def estimate_disk_gb(
+    config: AppConfig,
+    capture_seconds: float,
+    *,
+    measured: "MeasuredCapture | None" = None,
+) -> float:
+    """Mono8 RAW 会占多少 GB。**不含**离线角点结果和样本图（那些很小）。
+
+    ★ 尺寸一律取**全屏**（:meth:`AppConfig.effective_camera_size`）：
+    RAW 存的就是整幅原始帧，拿分析 ROI 的尺寸估会低估几十倍。
+    """
+    width, height = config.effective_camera_size(measured)
+    fps = config.effective_fps(measured)
     frames = float(capture_seconds) * fps
     return frames * width * height / (1024.0**3)
 
 
-def plan_disk_gb(config: AppConfig, plans: Iterable[Any]) -> tuple[float, float, float]:
+def plan_disk_gb(
+    config: AppConfig,
+    plans: Iterable[Any],
+    *,
+    measured: "MeasuredCapture | None" = None,
+) -> tuple[float, float, float]:
     """返回 (总占用 GB, 单段最大占用 GB, 总时长 秒)。
 
     单段最大值是给"边采边清"用的：RAW 处理完就删的话，盘上任何时刻只有
     **当前这一段**，峰值不是总和。
     """
     plan_list = list(plans)
-    seconds = estimate_capture_seconds(config, plan_list)
-    total = estimate_disk_gb(config, seconds)
-    per_plan = [
-        estimate_disk_gb(config, estimate_capture_seconds(config, [plan]))
+    seconds = estimate_capture_seconds(config, plan_list, measured=measured)
+    total = estimate_disk_gb(config, seconds, measured=measured)
+    segments = [
+        group
         for plan in plan_list
+        for group in segment_step_groups(list(getattr(plan, "steps", plan)))
     ]
-    return total, (max(per_plan) if per_plan else 0.0), seconds
+    per_segment = [
+        estimate_disk_gb(
+            config, estimate_capture_seconds(config, [group], measured=measured),
+            measured=measured,
+        )
+        for group in segments
+    ]
+    return total, (max(per_segment) if per_segment else 0.0), seconds
 
 
-def disk_estimate_lines(config: AppConfig, plans: Iterable[Any]) -> list[str]:
+def disk_estimate_lines(
+    config: AppConfig,
+    plans: Iterable[Any],
+    *,
+    measured: "MeasuredCapture | None" = None,
+) -> list[str]:
     """给界面/日志用的中文磁盘估算说明。"""
-    total_gb, peak_gb, seconds = plan_disk_gb(config, plans)
-    width, height = config.effective_camera_size()
-    fps = config.effective_fps()
+    plan_list = list(plans)
+    total_gb, peak_gb, seconds = plan_disk_gb(config, plan_list, measured=measured)
+    width, height = config.effective_camera_size(measured)
+    fps = config.effective_fps(measured)
+    frames = seconds * fps
     lines = [
         f"预计录制总时长：约 {seconds / 60.0:.1f} 分钟（{seconds:.0f} 秒）",
+        f"预计帧数：约 {frames:.0f} 帧",
         f"预计 RAW 占用：约 {total_gb:.2f} GB"
-        f"（{width}×{height} Mono8 @ {fps:.2f} fps）",
+        f"（全屏 {width}×{height} Mono8 @ {fps:.2f} fps，"
+        f"每帧 {width * height} 字节）",
     ]
-    if config.mode != "dry_run" and config.camera.roi is None:
+    if measured is not None:
         lines.append(
-            "★ 当前没有设置 ROI 裁剪：满幅 1936×1096 在 132 fps 下约 280 MB/s，"
-            "是磁盘占用的第一主导项。现场建议把 camera.roi 填成包住棋盘格的一块。"
+            f"★ 上面的尺寸和帧率来自实测（{measured.source or '5 s 全屏采集检查'}）："
+            f"{measured.width}×{measured.height} @ {measured.fps:.2f} fps"
+            + (
+                f"，实测写盘 {measured.write_mbps:.1f} MB/s"
+                if measured.write_mbps
+                else ""
+            )
+            + "。"
+        )
+    migrated = config.camera.roi_migration_note()
+    if migrated:
+        lines.append("★ " + migrated)
+    if config.camera.resolved_analysis_roi() is None:
+        lines.append(
+            "（离线分析用整幅画面：没有配 camera.analysis_roi。"
+            "这**不影响** RAW 大小——RAW 一律存整幅。）"
+        )
+    else:
+        lines.append(
+            f"（离线分析 ROI = {list(config.camera.analysis_roi)}："
+            "机器人停住之后只在这一块里找棋盘格，角点坐标会加回 ROI 偏移；"
+            "它**不影响** RAW 大小。）"
         )
     if config.paths.delete_raw_after_process:
         lines.append(
@@ -1269,7 +1614,7 @@ def disk_estimate_lines(config: AppConfig, plans: Iterable[Any]) -> list[str]:
     else:
         lines.append(
             "（原始帧全程留盘：camera.save_raw 必须为 true，本工具不提供关闭选项。"
-            "盘不够时请改用 paths.delete_raw_after_process 分组流水线，或裁小 ROI。）"
+            "盘不够时请打开 paths.delete_raw_after_process 分组流水线。）"
         )
     return lines
 
@@ -1279,31 +1624,67 @@ def disk_estimate_lines(config: AppConfig, plans: Iterable[Any]) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def segment_raw_gb(config: AppConfig, segment: Any) -> float:
+def segment_raw_gb(
+    config: AppConfig, segment: Any, *, measured: "MeasuredCapture | None" = None
+) -> float:
     """一段采集的 RAW 会占多少 GB。
 
     ``segment`` 可以是 ``SegmentPlan``，也可以是任何有 ``steps`` 的对象
     （``SegmentPlan.steps`` 就是"这一段包含的那一到两个计划步"）。
+
+    ★ 单独估一段时没有"上一次目标姿态"可参照，第一段会用"相对名义位姿的偏移"
+    作退路（见 :func:`_step_nominal_fallback`）。**磁盘闸门不要用这个函数**：
+    它对组 A 中间那些段是高估，对组 B 的回程段是低估。组的占用一律走
+    :func:`group_disk_gb`，它按顺序把每一段的真实运动量串起来。
     """
-    return float(estimate_disk_gb(config, estimate_capture_seconds(config, [segment])))
+    return float(
+        estimate_disk_gb(
+            config,
+            estimate_capture_seconds(config, [segment], measured=measured),
+            measured=measured,
+        )
+    )
 
 
-def group_disk_gb(config: AppConfig, segments: Iterable[Any]) -> tuple[float, float]:
+def group_disk_gb(
+    config: AppConfig,
+    segments: Iterable[Any],
+    *,
+    measured: "MeasuredCapture | None" = None,
+) -> tuple[float, float]:
     """一组动作的占用，返回 ``(RAW GB, 含派生文件 GB)``。
 
     为什么一组要单独算：分组流水线下，盘上同时存在的是**当前这一组**的全部段
     （整组采完才处理、才删），而不是单段、也不是整场。组的划分见
     ``experiment.ExperimentSession`` 的 ``begin_group`` 调用点。
+
+    ★ 这里**不是**把每段单独估一遍再相加。单独估一段时不知道"从哪个目标走过来"，
+    组 A 的阶梯和组 B 的回程都会算错（一个高估、一个低估）。所以整组按顺序走一遍，
+    每一步的运动量取相邻两个目标角之差。
     """
-    raw = sum(segment_raw_gb(config, segment) for segment in segments)
+    segment_list = list(segments)
+    seconds = estimate_capture_seconds(config, segment_list, measured=measured)
+    raw = float(estimate_disk_gb(config, seconds, measured=measured))
     ratio = float(config.paths.derived_overhead_ratio)
     return raw, raw * (1.0 + ratio)
 
 
-def group_peak_gb(config: AppConfig, groups: Mapping[str, Iterable[Any]]) -> tuple[float, str, dict[str, float]]:
-    """整场跑下来，盘上的峰值占用出现在哪一组。返回 ``(峰值 GB, 组名, 每组 GB)``。"""
+def group_peak_gb(
+    config: AppConfig,
+    groups: Mapping[str, Iterable[Any]],
+    *,
+    measured: "MeasuredCapture | None" = None,
+) -> tuple[float, str, dict[str, float]]:
+    """整场跑下来，盘上的峰值占用出现在哪一组。返回 ``(峰值 GB, 组名, 每组 GB)``。
+
+    ★ 这里返回的是**RAW + 派生文件**的驻留量，不含处理期那 15% 临时余量。
+    闸门（:func:`check_group_disk`）比的是含余量的那个峰值
+    （:attr:`GroupForecast.peak_gb`）。两个数都如实给出，但别混用：
+    拿这里的数去和 50 GB 硬上限比，会比真正执行的判据松 15%。
+    """
     per_group = {
-        str(name): group_disk_gb(config, segments)[1] for name, segments in groups.items()
+        str(name): group_disk_gb(config, segments, measured=measured)[1]
+        for name, segments in groups.items()
     }
     if not per_group:
         return 0.0, "", {}
@@ -1311,8 +1692,130 @@ def group_peak_gb(config: AppConfig, groups: Mapping[str, Iterable[Any]]) -> tup
     return per_group[name], name, per_group
 
 
+@dataclass(frozen=True)
+class GroupForecast:
+    """一组动作开工**之前**要报给操作者的那张表（需求二）。
+
+    需求二点名要这几项：本组动作数量、预计录制秒数、预计帧数、预计 RAW 大小、
+    预计峰值、是否低于 40/50 GB、本组结束后是否自动删除 RAW。这里一次算齐，
+    界面按字段显示、日志按 :meth:`lines` 输出，避免"界面上一个数、日志里另一个数"。
+    """
+
+    name: str
+    action_count: int
+    seconds: float
+    frames: float
+    raw_gb: float
+    derived_gb: float
+    resident_gb: float
+    process_peak_gb: float
+    width: int
+    height: int
+    fps: float
+    frame_bytes: int
+    warn_gb: float
+    cap_gb: float
+    delete_after: bool
+    measured_source: str = ""
+
+    #: ★ 40/50 GB 两条线比的是**同时驻留峰值**（RAW + 派生 + 处理期临时余量），
+    #: 不是只比 RAW+派生的那个中间量。需求二的原话是"当前同时驻留的 RAW +
+    #: 临时文件 + 本组派生文件估算值 ≤ 50 GB"——临时文件那一项就是
+    #: ``process_headroom`` 这 15%。早先这里比的是 ``resident_gb``：
+    #: 驻留 49 GB 的一组照样会放行，而它处理时的估算峰值是 56 GB，
+    #: 比需求写的那条线高出一截，等于把闸门悄悄放宽了 15%。
+    #: ``under_warn`` / ``under_cap`` 与 :func:`check_group_disk` 里的硬拦
+    #: 用的是**同一个数**，界面上"是否低于硬上限"那一行才和真正执行的判据一致。
+    @property
+    def peak_gb(self) -> float:
+        """决定了"这一组会不会被拦"的那个数（含处理期临时余量）。"""
+        return self.process_peak_gb
+
+    @property
+    def under_warn(self) -> bool:
+        return self.peak_gb <= self.warn_gb
+
+    @property
+    def under_cap(self) -> bool:
+        return self.peak_gb <= self.cap_gb
+
+    def lines(self) -> list[str]:
+        """中文的预报表：一眼看清"这一组要录多久、占多少盘、会不会被拦"。"""
+        size_text = (
+            f"全屏 {self.width}×{self.height} Mono8"
+            + (f"（实测：{self.measured_source}）" if self.measured_source else "")
+        )
+        lines = [
+            f"【{self.name}】动作数量：{self.action_count} 段采集",
+            f"  预计录制秒数：{self.seconds:.1f} s"
+            f"（{self.seconds / 60.0:.2f} 分钟）",
+            f"  预计帧数：约 {self.frames:.0f} 帧（{self.fps:.2f} fps）",
+            f"  预计 RAW 大小：{self.raw_gb:.2f} GB（{size_text}，"
+            f"每帧 {self.frame_bytes} 字节）",
+            f"  预计派生文件：{self.derived_gb:.2f} GB"
+            f"（按 RAW 的 {self.derived_gb / self.raw_gb:.0%} 计）"
+            if self.raw_gb > 0
+            else "  预计派生文件：0.00 GB",
+            f"  预计同时驻留：{self.resident_gb:.2f} GB"
+            f"（RAW {self.raw_gb:.2f} + 派生 {self.derived_gb:.2f}）",
+            f"  预计同时驻留峰值：{self.process_peak_gb:.2f} GB"
+            f"（= 上面那个数 + 处理期临时余量 "
+            f"{(self.process_peak_gb - self.resident_gb):.2f} GB；"
+            "下面两条 40/50 GB 的线比的就是这个峰值）",
+            f"  是否低于预警线 {self.warn_gb:.0f} GB："
+            + ("是" if self.under_warn else "**否**"),
+            f"  是否低于硬上限 {self.cap_gb:.0f} GB："
+            + ("是" if self.under_cap else "**否——不得开始这一组**"),
+            "  本组结束后是否自动删除 RAW："
+            + (
+                "**是**（校验通过才删；校验不过保留 RAW 并暂停）"
+                if self.delete_after
+                else "否（分组流水线没打开，原始帧全程留盘）"
+            ),
+        ]
+        return lines
+
+
+def group_forecast(
+    config: AppConfig,
+    segments: Iterable[Any],
+    *,
+    name: str = "本组动作",
+    measured: "MeasuredCapture | None" = None,
+) -> GroupForecast:
+    """算出一组动作的预报（需求二）。**只看计划，不碰磁盘、不发命令。**"""
+    segment_list = list(segments)
+    seconds = estimate_capture_seconds(config, segment_list, measured=measured)
+    width, height = config.effective_camera_size(measured)
+    fps = config.effective_fps(measured)
+    raw_gb, resident_gb = group_disk_gb(config, segment_list, measured=measured)
+    headroom = float(config.paths.process_headroom)
+    return GroupForecast(
+        name=str(name),
+        action_count=count_recording_segments(segment_list),
+        seconds=float(seconds),
+        frames=float(seconds) * fps,
+        raw_gb=float(raw_gb),
+        derived_gb=float(resident_gb - raw_gb),
+        resident_gb=float(resident_gb),
+        process_peak_gb=float(resident_gb) * headroom,
+        width=int(width),
+        height=int(height),
+        fps=float(fps),
+        frame_bytes=int(width * height),
+        warn_gb=float(config.paths.disk_warn_gb),
+        cap_gb=float(config.paths.max_peak_disk_gb),
+        delete_after=bool(config.paths.delete_raw_after_process),
+        measured_source="" if measured is None else str(measured.source),
+    )
+
+
 def check_group_disk(
-    config: AppConfig, segments: Iterable[Any], *, what: str = "本组动作"
+    config: AppConfig,
+    segments: Iterable[Any],
+    *,
+    what: str = "本组动作",
+    measured: "MeasuredCapture | None" = None,
 ) -> tuple[bool, list[str]]:
     """进入下一组动作之前的磁盘闸门（需求一）。
 
@@ -1324,60 +1827,65 @@ def check_group_disk(
     3. **硬拦**：超过 ``paths.max_peak_disk_gb``（默认 50 GB）**或**可用空间不够，
        直接拒绝开始这一组。这一条是"不得开始下一组"的落地处。
 
+    ★ 比的数是**同时驻留峰值** = RAW + 派生 + 处理期临时余量（``process_headroom``）。
+    需求二写的是"同时驻留的 RAW + 临时文件 + 本组派生文件估算值 ≤ 50 GB"，
+    临时文件那一项不能漏掉：只比 RAW+派生的话，驻留 49 GB 的一组会被放行，
+    而它处理时的峰值是 56 GB——闸门等于被悄悄放宽了 15%。
+
     为什么用"这一组"而不是"这一段"：一组是流水线上"同时驻留"的单位，
     整组采完才处理，所以峰值就是这一组的总和。单段算会低估几十倍。
 
+    ★ 尺寸和帧率一律取**全屏 + 实测**（``measured`` 是 5 s 检查的结果）：
+    拿分析 ROI 估会低估，拿配置里的期望帧率估会和现场差一截。
+
     ★ **硬上限只在分组流水线打开时才算。** ``max_peak_disk_gb`` 说的是
     "任意时刻盘上的 RAW + 临时文件"——只有"处理完就删"时才等于"当前这一组"。
-    开关关着的时候 RAW 是**全程累积**的，拿 50 GB 去卡每一组会让默认配置
-    根本跑不起来（整场就是 200～350 GB 的量级），那不是在保护数据，
-    是在逼人关掉检查。所以那种情况下这里只查"这一组要写的量 + 绝对下限"
-    够不够，并把估算如实报出来。
+    开关关着的时候 RAW 是**全程累积**的，拿 50 GB 去卡每一组会让配置
+    根本跑不起来，那不是在保护数据，是在逼人关掉检查。所以那种情况下这里
+    只查"这一组要写的量 + 绝对下限"够不够，并把估算如实报出来。
     """
     segment_list = list(segments)
-    raw_gb, total_gb = group_disk_gb(config, segment_list)
+    forecast = group_forecast(config, segment_list, name=what, measured=measured)
     rolling = bool(config.paths.delete_raw_after_process)
-    peak = float(config.paths.max_peak_disk_gb)
-    warn = float(config.paths.disk_warn_gb)
     headroom = float(config.paths.process_headroom)
-    need_gb = max(float(config.paths.min_free_disk_gb), total_gb * headroom)
-    lines = [
-        f"{what}：{len(segment_list)} 段，RAW 约 {raw_gb:.2f} GB，"
-        f"含派生文件约 {total_gb:.2f} GB（派生按 RAW 的 "
-        f"{float(config.paths.derived_overhead_ratio):.0%} 计）",
-    ]
-    if rolling:
-        lines.append(f"硬上限 {peak:.0f} GB / 预警线 {warn:.0f} GB")
-    else:
+    need_gb = max(
+        float(config.paths.min_free_disk_gb), forecast.process_peak_gb
+    )
+    lines = forecast.lines()
+    if not rolling:
         lines.append(
             "（分组流水线未打开：RAW 全程累积，整场总和才是峰值，"
             "因此不拿单组硬上限来卡；本组估算仅供参考。）"
         )
     lines.append(
-        f"按计划需要约 {need_gb:.2f} GB（含 {int((headroom - 1) * 100)}% 余量）"
+        f"按计划需要约 {need_gb:.2f} GB（含 {int((headroom - 1) * 100)}% 处理余量）"
     )
-    if rolling and total_gb > peak:
+    if rolling and forecast.peak_gb > forecast.cap_gb:
         lines.append(
-            f"磁盘检查未通过：本组估算 {total_gb:.2f} GB 超过硬上限 {peak:.0f} GB，"
-            "**不得开始这一组**。可做的三件事：把 camera.roi 裁到刚好包住棋盘格；"
-            "把这一组再拆小（例如减少 formal.staircase_n 或 repeats）；"
-            "或换一个更大的输出盘。"
+            f"磁盘检查未通过：本组同时驻留峰值估算 {forecast.peak_gb:.2f} GB "
+            f"（RAW {forecast.raw_gb:.2f} + 派生 {forecast.derived_gb:.2f} + "
+            f"处理期临时余量 "
+            f"{forecast.process_peak_gb - forecast.resident_gb:.2f}）"
+            f"超过硬上限 {forecast.cap_gb:.0f} GB，**不得开始这一组**。"
+            "可做的三件事：把这一组再拆小（例如按每个关节的每一遍 repeat 单独成组，"
+            "或者按正负循环再拆）；把 camera.analysis_roi 留空/调大只会影响分析速度、"
+            "**不会**减小 RAW；或换一个更大的输出盘。"
+            "不许为了过这条闸门去减少动作数量、重复次数或采集帧率。"
         )
         return False, lines
     ok, message = check_free_disk(config.resolve_output_root(), need_gb)
-    if ok and rolling and total_gb > warn:
+    if ok and rolling and not forecast.under_warn:
         lines.append(
-            f"★ 磁盘预警：本组估算 {total_gb:.2f} GB 已超过预警线 {warn:.0f} GB"
-            f"（硬上限 {peak:.0f} GB）。本次放行，但建议先清盘或裁小 ROI，"
-            "否则再大一点就会被硬拦。"
+            f"★ 磁盘预警：本组同时驻留峰值估算 {forecast.peak_gb:.2f} GB 已超过预警线 "
+            f"{forecast.warn_gb:.0f} GB（硬上限 {forecast.cap_gb:.0f} GB）。"
+            "本次放行，但建议先清盘，否则再大一点就会被硬拦。"
         )
     if ok:
         lines.append(f"磁盘检查：{message}")
     else:
         lines.append(
             f"磁盘检查未通过：{message}"
-            "可做的三件事：把 camera.roi 裁到刚好包住棋盘格；"
-            "把这一组再拆小；或换一个更大的输出盘。"
+            "可做的三件事：把这一组再拆小；清一清输出盘；或换一个更大的输出盘。"
         )
     return bool(ok), lines
 
@@ -1387,6 +1895,7 @@ def check_plan_disk(
     plans: Iterable[Any],
     *,
     headroom: float = 1.15,
+    measured: "MeasuredCapture | None" = None,
 ) -> tuple[bool, list[str]]:
     """按**这一次要跑的计划**算占用，再和可用空间比。返回 (是否够, 中文说明)。
 
@@ -1399,8 +1908,8 @@ def check_plan_disk(
     再和"绝对下限"取较大者。不够就返回 False，由调用方**拒绝开始**这一段。
     """
     plan_list = list(plans)
-    lines = disk_estimate_lines(config, plan_list)
-    total_gb, peak_gb, _seconds = plan_disk_gb(config, plan_list)
+    lines = disk_estimate_lines(config, plan_list, measured=measured)
+    total_gb, peak_gb, _seconds = plan_disk_gb(config, plan_list, measured=measured)
     # 边采边清时，盘上只要放得下"最大的那一段"，因为上一段在处理完就被删了；
     # 但**不能**因此把门槛降到 0——正在录的那一段仍然要一次写完。
     size_gb = peak_gb if config.paths.delete_raw_after_process else total_gb
@@ -1416,9 +1925,8 @@ def check_plan_disk(
         lines.append(
             f"磁盘检查未通过：{message}"
             f"{what}按计划需要约 {need_gb:.2f} GB。"
-            "可做的三件事：把 camera.roi 裁到刚好包住棋盘格；"
-            "或打开 paths.delete_raw_after_process（边采边清：每段处理完就删 RAW，"
-            "盘上只留当前这一段）；或换一个更大的输出盘。"
+            "可做的三件事：把这一组再拆小（每个关节的每一遍 repeat 单独成组）；"
+            "清一清输出盘；或换一个更大的输出盘。"
         )
     return ok, lines
 

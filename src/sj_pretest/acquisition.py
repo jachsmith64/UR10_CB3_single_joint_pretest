@@ -191,16 +191,17 @@ class CaptureEngine:
         self._pending: Any = None
         self.segments: list[SegmentCapture] = []
         self.camera = vendor_module("camera")
-        # ★ 干运行**也**照用 camera.roi。原来这里写着"dry_run 就不裁"，
-        # 结果是：ROI 这条路径在自测里一步都没走过，而现场最常出的事
-        # （ROI 写大了/写歪了、预览和 RAW 不是一块画面）恰恰只在真机上才暴露。
-        # 干运行的画面尺寸来自 dry_run.width/height，所以 ROI 要是比它大，
-        # 会在"开始之前"就被 ROI 检查拦下来并说明原因——这是如实报错，不是静默降级。
-        roi = config.camera.roi
-        self.roi: tuple[int, int, int, int] | None = (
-            tuple(int(value) for value in roi) if roi else None
-        )  # type: ignore[assignment]
-        #: 第一帧的原始尺寸（裁剪**之前**），用来在界面上报"原始画面尺寸"。
+        # ★ v1.0.3：**采集期间不裁任何东西**。RAW 里逐帧写的就是原始整幅。
+        # 这个 ROI 只用于"机器人停住之后"的离线识别（和预览图上画的那个框），
+        # 它不改变 RAW 的尺寸，也就不会改变磁盘占用。
+        # 干运行**也**照用它：原来这里写着"dry_run 就不裁"，结果是 ROI 这条路径
+        # 在自测里一步都没走过，而现场最常出的事（ROI 写大了/写歪了）恰恰只在
+        # 真机上才暴露。干运行的画面尺寸来自 dry_run.width/height，所以 ROI 要是
+        # 比它大，会在"开始之前"就被 ROI 检查拦下来并说明原因——如实报错，不是静默降级。
+        self.analysis_roi: tuple[int, int, int, int] | None = (
+            config.camera.resolved_analysis_roi()
+        )
+        #: 第一帧的原始尺寸。RAW 里存的就是这个尺寸（v1.0.3 起不再有"裁剪后尺寸"）。
         self.source_width = 0
         self.source_height = 0
 
@@ -259,17 +260,10 @@ class CaptureEngine:
         raw_stream = temp_path.open("wb")
         try:
             first = self._next_frame()
-            # 原始尺寸要在裁剪**之前**记下来：界面上"原始画面尺寸 / ROI / 裁剪后尺寸"
-            # 三个数缺一不可，只看裁剪后的尺寸没法判断 ROI 坐标写得对不对。
             self.source_height = int(first.frame.shape[0])
             self.source_width = int(first.frame.shape[1])
-            frame = self.crop(first.frame)
+            frame = self.raw_frame(first.frame)
             height, width = int(frame.shape[0]), int(frame.shape[1])
-            if frame.ndim != 2 or frame.dtype != np.uint8:
-                raise CaptureError(
-                    "RAW 采集只支持 Mono8（二维 uint8）帧，"
-                    f"实际 shape={frame.shape} dtype={frame.dtype}。"
-                )
             segment_start_ns = int(first.host_ns)
 
             def content_time_s(packet: Any) -> float:
@@ -354,7 +348,7 @@ class CaptureEngine:
                         break
 
                     first = packet
-                    frame = self.crop(packet.frame)
+                    frame = self.raw_frame(packet.frame)
                     if frame.shape != (height, width):
                         raise CaptureError(
                             "采集过程中帧尺寸发生变化："
@@ -373,8 +367,9 @@ class CaptureEngine:
                 if stopped_early:
                     break
                 if index < len(plan_phases) - 1:
+                    # 下一阶段的头一帧：整幅（RAW 一律全屏，见 raw_frame）。
                     first = self._next_frame()
-                    frame = self.crop(first.frame)
+                    frame = self.raw_frame(first.frame)
         finally:
             raw_stream.close()
 
@@ -448,11 +443,27 @@ class CaptureEngine:
             "segment_id": segment_id,
             "segment_kind": kind,
             "synthetic": self.synthetic,
-            # ★ ROI 只认这一份，而且 RAW 里存的**就是**裁完的图：
-            # 到位预览、 completeness/余量检查、快速几何检查、离线识别全都拿这张
-            # 裁过的图去做，界面上显示的也是它 + 下面这三个尺寸。
-            "roi": list(self.roi) if self.roi else None,
+            # ★ 尺寸三件套（需求一.2 点名要存这几项）：
+            #   source_size    —— 原始帧尺寸（相机给的画面，一个像素都没裁）
+            #   raw_size       —— RAW **实际**保存的尺寸（v1.0.3 起恒等于 source_size）
+            #   analysis_roi   —— 离线分析用的 ROI（原图坐标），null = 整幅
+            #   roi_origin     —— 那个 ROI 在原图里的左上角偏移，用来把角点坐标换算回原图
+            #   corners_frame  —— 角点/质心坐标是"原图坐标"还是"ROI 局部坐标"
+            # 这五个值缺一个，"这段数据还能不能复算"就说不清。
             "source_size": [int(self.source_width), int(self.source_height)],
+            "raw_size": [int(width), int(height)],
+            "analysis_roi": (
+                None if self.analysis_roi is None else [int(v) for v in self.analysis_roi]
+            ),
+            "roi_origin": (
+                None
+                if self.analysis_roi is None
+                else [int(self.analysis_roi[0]), int(self.analysis_roi[1])]
+            ),
+            "corners_frame": "full_image",
+            # 兼容 v1.0.2 的读法：旧字段名仍然写着"裁剪后尺寸"，但 v1.0.3 起
+            # RAW 就是整幅，所以这两个值必然相等。留着是为了让旧的分析脚本
+            # 不会因为读不到键而炸。
             "cropped_size": [int(width), int(height)],
             "content_seconds": content_seconds,
             "stopped_early": bool(stopped_early),
@@ -490,52 +501,87 @@ class CaptureEngine:
 
     # -- 内部 -------------------------------------------------------------
 
-    def crop(self, frame: np.ndarray) -> np.ndarray:
-        """裁剪 ROI（如果配了）。裁剪发生在写盘之前，所以 RAW 里存的就是裁过的图，
-        这样磁盘占用和后续解析开销都按裁剪后的尺寸算。
+    def raw_frame(self, frame: np.ndarray) -> np.ndarray:
+        """RAW 里要写的那一帧：**原始整幅，一个像素都不裁**（v1.0.3 硬要求）。
 
-        ★ 这是**唯一**的裁剪实现。到位预览、棋盘格完整性/余量检查、快速几何检查
-        都必须调它，不许各自再切一刀——三处各切一刀就是三份不同的 ROI，
-        而人看到的预览和 RAW 里真实存下的图一旦不一致，
-        "预览里棋盘格好好的、离线识别却找不到角点"这种问题就会在现场发生。
+        ★ 需求一.2：全屏采集，ROI **只**用于离线分析。以前这里裁过
+        （旧 ``crop()``）：换来的是磁盘小几倍，代价是"ROI 之外的画面永久没有了"
+        ——棋盘格一旦因为碰撞、松动或者人碰了支架而跑出那一块，现场再也查不出原因；
+        而"相机没动过"这种假设恰恰是实验里最容易失效的一条。
+        所以现在：RAW 一律整幅落盘，裁剪只发生在机器人停住之后的离线识别里。
+
+        这里顺带做 Mono8 校验（RAW 的解析前提就是"每帧 = 宽×高 个字节"）。
         """
-        if self.roi is None:
+        if frame.ndim != 2 or frame.dtype != np.uint8:
+            raise CaptureError(
+                "RAW 采集只支持 Mono8（二维 uint8）帧，"
+                f"实际 shape={frame.shape} dtype={frame.dtype}。"
+            )
+        return frame
+
+    def analysis_crop(self, frame: np.ndarray) -> np.ndarray:
+        """按**离线分析 ROI** 裁剪。**只准给"机器人停住之后"的分析用。**
+
+        采集路径一次都不许调它——RAW 里必须是整幅（见 :meth:`raw_frame`）。
+
+        ★ 这是本模块里**唯一**的裁剪实现，参数就是离线识别真正会用的那一块。
+        离线识别走被复用代码的 ``VISION_ROI``（见 ``vision.process_segment``），
+        和这里是同一个矩形；两处各裁一刀就是两份 ROI，
+        "检查时看的是这一块、识别时看的是另一块"这种问题会直接毁掉一批数据。
+        """
+        if self.analysis_roi is None:
             return frame
-        x, y, width, height = self.roi
+        x, y, width, height = self.analysis_roi
         if y + height > frame.shape[0] or x + width > frame.shape[1]:
             raise CaptureError(
-                f"camera.roi={list(self.roi)} 超出帧尺寸 "
+                f"camera.analysis_roi={list(self.analysis_roi)} 超出帧尺寸 "
                 f"{frame.shape[1]}×{frame.shape[0]}，无法裁剪。"
             )
         return np.ascontiguousarray(frame[y : y + height, x : x + width])
 
     def roi_report(self, frame: np.ndarray) -> dict[str, Any]:
-        """按**实际这一帧**报告三个尺寸：原始画面 / ROI / 裁剪后。
+        """按**实际这一帧**报告尺寸与 ROI，供界面显示、供检查判越界。
 
-        界面上要显示的就是这三行——现场判断"ROI 写对了没有"只看这个。
-        越界不抛异常，而是如实返回 ``ok=False`` 和一个中文原因，
+        需求一.2 要求存/显示的四件事：原始帧尺寸、RAW 实际保存尺寸、
+        离线分析 ROI、ROI 偏移。v1.0.3 起"RAW 实际保存尺寸"恒等于"原始帧尺寸"
+        ——RAW 不再裁剪。越界不抛异常，而是如实返回 ``ok=False`` 和中文原因，
         让调用方决定是拒绝开始还是先提示。
         """
         source_height, source_width = int(frame.shape[0]), int(frame.shape[1])
         report: dict[str, Any] = {
             "source_width": source_width,
             "source_height": source_height,
-            "roi": list(self.roi) if self.roi else None,
+            "raw_width": source_width,
+            "raw_height": source_height,
+            "analysis_roi": (
+                None
+                if self.analysis_roi is None
+                else [int(value) for value in self.analysis_roi]
+            ),
+            "roi_origin": (
+                None
+                if self.analysis_roi is None
+                else [int(self.analysis_roi[0]), int(self.analysis_roi[1])]
+            ),
             "ok": True,
             "why": "",
         }
-        if self.roi is None:
-            report.update({"crop_width": source_width, "crop_height": source_height})
+        if self.analysis_roi is None:
+            report.update(
+                {"analysis_width": source_width, "analysis_height": source_height}
+            )
             return report
-        x, y, width, height = self.roi
-        report.update({"crop_width": int(width), "crop_height": int(height)})
+        x, y, width, height = self.analysis_roi
+        report.update({"analysis_width": int(width), "analysis_height": int(height)})
         if x + width > source_width or y + height > source_height:
             report.update(
                 {
                     "ok": False,
                     "why": (
-                        f"camera.roi={list(self.roi)} 超出原始画面 "
-                        f"{source_width}×{source_height}（要求 x+w ≤ 宽、y+h ≤ 高）"
+                        f"camera.analysis_roi={list(self.analysis_roi)} 超出原始画面 "
+                        f"{source_width}×{source_height}（要求 x+w ≤ 宽、y+h ≤ 高）。"
+                        "注意它只影响离线分析，不影响 RAW 大小；越界时离线识别"
+                        "会直接读不到棋盘格，所以这里必须拦。"
                     ),
                 }
             )
@@ -544,15 +590,21 @@ class CaptureEngine:
     @staticmethod
     def roi_report_lines(report: dict[str, Any]) -> list[str]:
         """把 :meth:`roi_report` 的结果说成人话（界面和日志共用一套措辞）。"""
-        roi_text = (
-            "不裁剪（整幅）"
-            if not report.get("roi")
-            else f"ROI = {list(report['roi'])}"
-        )
+        roi = report.get("analysis_roi")
+        roi_text = "整幅分析（不裁）" if not roi else f"离线分析 ROI = {list(roi)}"
+        origin = report.get("roi_origin")
         lines = [
-            f"原始画面尺寸：{report['source_width']}×{report['source_height']} px",
-            f"ROI 坐标：{roi_text}",
-            f"裁剪后尺寸：{report['crop_width']}×{report['crop_height']} px",
+            f"原始帧尺寸：{report['source_width']}×{report['source_height']} px",
+            f"RAW 实际保存尺寸：{report['raw_width']}×{report['raw_height']} px"
+            "（全屏整幅，不裁）",
+            f"{roi_text}"
+            + (
+                "，ROI 偏移 = "
+                f"({int(origin[0])}, {int(origin[1])})，"
+                f"分析窗口 {report['analysis_width']}×{report['analysis_height']} px"
+                if roi
+                else ""
+            ),
         ]
         if not report.get("ok", True):
             lines.append(f"★ ROI 越界：{report.get('why', '')}")
@@ -583,6 +635,37 @@ class CaptureEngine:
                 "回放模式请检查历史数据是否覆盖了完整实验；"
                 "真机模式请检查相机是否掉线。"
             ) from exc
+
+    def drain_frames(
+        self, count: int, *, stop_requested: Callable[[], bool] | None = None
+    ) -> tuple[int, int | None]:
+        """丢弃相机缓冲里压着的旧帧，返回 ``(丢掉了多少帧, 最后一帧的帧号)``。
+
+        ★ v1.0.3 需求一·7：离线处理一组数据要几十秒到几分钟，这段时间里没人取帧，
+        相机的 SDK 缓冲（以及本引擎暂存的那一帧）里会积压这段时间的画面。
+        重新开录时如果直接接着取，下一段的头几帧拿到的是**处理期间**的旧画面
+        ——那时机器人还没开始动，相位边界会被这几帧顶歪，
+        而且"处理时没读的帧"还会以 frame_id 跳号的形式被误当成下一段掉帧。
+
+        丢掉几帧很便宜（132 fps 下 5 帧约 38 ms），比让一整段的时间轴歪掉划算得多。
+        帧号基线也随之重建：调用方把返回的最后一帧号记进事件流，
+        下一段的 ``capture_metadata.json`` 里本来就写着它自己的 ``first_frame_id``，
+        两处一对就能说明"跨组那段空白是处理时间，不是掉帧"。
+        """
+        dropped = 0
+        last_frame_id: int | None = None
+        for _ in range(max(0, int(count))):
+            if stop_requested is not None and stop_requested():
+                break
+            try:
+                packet = self._next_frame()
+            except CaptureError:
+                # 来源已经空了：这一条不该在这里报错——下一段采集自己会用
+                # 中文说清"来源没帧了"，在这里抛只会把真正的原因盖掉。
+                break
+            dropped += 1
+            last_frame_id = int(getattr(packet, "frame_id", 0) or 0)
+        return dropped, last_frame_id
 
     def _actual_fps(self) -> float:
         value = getattr(self.source, "actual_camera_fps", None)

@@ -284,6 +284,66 @@ def test_static_noise_matches_the_injected_level(tmp_path: Path) -> None:
     assert abs(noise.drift_x_px) < 3.0 * noise.std_x_px
 
 
+def test_the_baseline_duration_in_the_report_is_the_capture_not_the_processing(
+    tmp_path: Path,
+) -> None:
+    """报告里的"静态基线 N 秒"必须是**录了多久**，不是这段离线算了多久。
+
+    为什么单独立一条：这两个数很容易互相冒充——都是正数、都是秒、量级也只差几倍。
+    干运行里 3.0 s 的静止采集曾经被写成 14.5 s（那是处理 397 帧的 wall clock），
+    而这个数正好写在"静态基线"那一行的开头，读报告的人没有任何线索能看出来
+    它其实在说算力。所以这里两头都验：采集时长要对得上**采集层**写下的
+    ``content_seconds``，处理耗时单独一个字段，谁也别顶替谁。
+    """
+    config = build_config(tmp_path, joints=("J1",), amplitudes=(0.2,))
+    session, _rec = open_session(config, recorder=Recorder(answer=True))
+    try:
+        record = session.capture_static(segment_id="static_base", duration_s=1.2)
+        report = session.analyze_offline(stride=1)
+    finally:
+        session.close()
+
+    noise = report.static_noise
+    assert noise is not None
+    captured = float(record.metadata["content_seconds"])
+    assert noise.seconds == pytest.approx(captured, abs=1e-6), (
+        f"报告里写的是静态基线 {noise.seconds:.3f} s，采集层实际录了 {captured:.3f} s"
+    )
+    assert noise.captured_frames == int(record.metadata["frame_count"])
+    # 处理耗时是另一件事：它必须真的是这一段的离线处理时间（> 0），
+    # 而且**不能**被当成采集时长写进去。
+    assert noise.process_seconds >= 0.0
+    payload = noise.to_dict()
+    assert payload["seconds"] == pytest.approx(captured, abs=1e-6)
+    assert payload["captured_frames"] == int(record.metadata["frame_count"])
+    # 文本报告里"录了多久"和"统计了多少帧"都要出现，且不能张冠李戴。
+    text = "\n".join(noise.summary_lines())
+    assert f"本段录了 {int(record.metadata['frame_count'])} 帧" in text, text
+
+    # ★ 抽帧之后"录了多少"不许跟着变小。抽帧少的只是**参与统计**的帧，
+    # RAW 里依然是那么多帧——这一条是反向用例：subsampled() 漏抄采集口径时，
+    # 报告会写成"本段录了 50 帧"，而那一段其实录了 397 帧。
+    session2, _rec2 = open_session(
+        build_config(tmp_path, joints=("J1",), amplitudes=(0.2,)),
+        recorder=Recorder(answer=True),
+    )
+    try:
+        record2 = session2.capture_static(segment_id="static_base", duration_s=1.2)
+        report2 = session2.analyze_offline(stride=3)
+    finally:
+        session2.close()
+    noise2 = report2.static_noise
+    assert noise2 is not None
+    assert noise2.captured_frames == int(record2.metadata["frame_count"]), (
+        f"抽帧之后报告的采集帧数变成了 {noise2.captured_frames}，"
+        f"实际录了 {int(record2.metadata['frame_count'])} 帧"
+    )
+    assert noise2.frames < noise2.captured_frames or noise2.captured_frames == 0
+    assert noise2.seconds == pytest.approx(
+        float(record2.metadata["content_seconds"]), abs=1e-6
+    )
+
+
 # --------------------------------------------------------------------------
 # 只采了静态基线就分析（预实验被中止）：要出带表头的空表，并说清是"没测"
 # --------------------------------------------------------------------------

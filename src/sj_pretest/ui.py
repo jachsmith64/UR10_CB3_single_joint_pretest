@@ -71,9 +71,17 @@ PARAMETER_SPEC: tuple[tuple[str, str, str], ...] = (
     # ★ 工作距离：只用来把"棋盘格在画面里变大/变小了多少"换算成轴向位移。
     # 现场量一次相机到板面的竖直距离填进来。
     ("相机", "camera.working_distance_mm", "float"),
-    ("相机", "camera.roi", "optional_ints"),
+    # ★ 离线分析 ROI（v1.0.3）。留空 = 整幅分析。它**只**影响机器人停住之后的
+    # 离线识别和预览图上的红框，**不改变 RAW 的大小**（RAW 一律整幅落盘）。
+    # 界面上仍然能填旧名 camera.roi，两者不一致会直接报错（不悄悄挑一个）。
+    ("相机", "camera.analysis_roi", "optional_ints"),
     ("相机", "camera.min_margin_px", "int"),
     ("相机", "camera.max_dropped_ratio", "float"),
+    # ★ 连接设备后 5 s 全屏采集检查的门槛（需求一.3）。都不是硬编码在业务逻辑里的常量。
+    ("相机", "camera.connection_check_s", "float"),
+    ("相机", "camera.min_fps_ratio", "float"),
+    ("相机", "camera.min_write_headroom", "float"),
+    ("相机", "camera.resume_drain_frames", "int"),
     # save_raw 说明：本工具**不允许**关掉原始帧落盘（关掉就没有可复核的原始数据了）。
     # 盘不够请用下面输出组里的"边采边清"。
     ("相机", "camera.save_raw", "bool"),
@@ -110,8 +118,10 @@ PARAMETER_SPEC: tuple[tuple[str, str, str], ...] = (
     ("输出", "paths.min_free_disk_gb", "float"),
     # ★ 分组流水线（需求一）：**一组动作全部走完、机械臂停稳之后**整组处理，
     # 落盘角点+逐帧结果并回读校验，通过了才删这一组的 RAW。
-    # 打开它，盘上任何时刻只有当前这一组（800×600 约 22 GB、950×800 约 36 GB），
-    # 而不是整场的总和（200～350 GB）。组的划分见 experiment.begin_group。
+    # ★ v1.0.3 起**默认就是开的**（交付默认 delete_raw_after_process=true）：
+    # RAW 一律整幅，一趟实验的原始帧是几百 GB～1 TB，不边采边清盘上放不下。
+    # 默认开着**不等于**降低数据安全要求：删除前的六项校验一条都没少，
+    # 校验不过就保留 RAW 并暂停等人处理（见 experiment.process_and_release）。
     ("输出", "paths.delete_raw_after_process", "bool"),
     # ★ 就地处理的步长。删 RAW 之前必须是 1（每一帧都算过），配置校验会硬拦。
     # 4 只能用在"不删数据"的现场快速预览上。
@@ -131,6 +141,27 @@ class UiError(RuntimeError):
 # --------------------------------------------------------------------------
 # 配置读写（界面上的每一个数都走这里，保证"界面显示=落盘内容"）
 # --------------------------------------------------------------------------
+
+
+def pipeline_status_line(config: AppConfig) -> str:
+    """一行话说清"RAW 会不会在采完一组之后被删掉"（需求一·1）。
+
+    ★ 交付默认是**开着**的，而且这行字必须一眼能看见：现场最怕的就是
+    "以为 RAW 都留着，回头才发现被删了"或者反过来"以为删了，其实一直没删、
+    盘满了"。措辞要能同时说明"开/关"和"删除前有校验"。
+    """
+    if bool(config.paths.delete_raw_after_process):
+        return (
+            "分组处理并删除RAW：已开启"
+            f"（每组动作走完、机械臂停稳后整组处理；六项校验通过才删这一组的 RAW，"
+            f"校验不过就保留 RAW 并暂停。处理步长 {int(config.paths.process_stride)}，"
+            "删 RAW 时必须为 1。）"
+        )
+    return (
+        "分组处理并删除RAW：已关闭"
+        "（RAW 全程保留、不删；本趟的原始帧会一路累积，"
+        "请确认输出盘放得下整场的量。）"
+    )
 
 
 def get_field(config: AppConfig, path: str) -> Any:
@@ -411,6 +442,18 @@ class ExperimentApp:
         for column, button in enumerate((self.btn_connect, self.btn_pretest, self.btn_analyze)):
             button.grid(row=0, column=column, sticky="we", padx=4, pady=2)
             main.columnconfigure(column, weight=1)
+        # ★ 需求一·3：连上设备之后会立刻做一次 5 s 全屏采集检查；没通过就禁止运动。
+        # 现场改完曝光/帧率/盘之后要能**就地重做**这一次检查，不必重启整个工具。
+        # 它不动机器人，所以随时可以点。
+        self.btn_recheck = ttk.Button(
+            main, text="重做 5 s 全屏采集检查（不动机器人）", command=self.on_recheck
+        )
+        self.btn_recheck.grid(row=1, column=0, columnspan=3, sticky="we", padx=4, pady=2)
+        ttk.Label(
+            main,
+            text="这一项在连上设备后自动做过一次：量实际分辨率/帧率/缺帧/写盘速度；"
+            "不通过就禁止一切运动。后面每一组的磁盘峰值都用这次实测值算。",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=4)
 
         # 正式实验
         formal = ttk.LabelFrame(outer, text="正式实验（先做理论范围检查，不是碰撞检查）", padding=6)
@@ -487,6 +530,8 @@ class ExperimentApp:
             "真实碰撞状态一律记为 unknown。"
         )
         self.append_log(f"当前模式：{self.config.mode}；输出目录：{self.output_var.get()}")
+        # ★ 需求一·1：这一行必须一眼看得见——"RAW 会不会被删"是现场最关键的一件事。
+        self.append_log(pipeline_status_line(self.config))
         # 开跑之前就把"这场实验要占多久、多少盘"摆出来。按钮按下之后再知道
         # 是几十分钟、几百 GB，就太晚了。
         try:
@@ -555,6 +600,8 @@ class ExperimentApp:
         if self.session is None:
             self.btn_pretest.configure(state="disabled")
             self.btn_analyze.configure(state="disabled")
+            # 重做采集检查也要有会话（要有相机来源）才有意义。
+            self.btn_recheck.configure(state="disabled")
         elif self._busy:
             self.btn_pretest.configure(state="disabled")
             self.btn_analyze.configure(state="disabled")
@@ -722,6 +769,43 @@ class ExperimentApp:
                 self.append_log(line)
 
         self._run_task("按钮一：连接设备并到达实验姿态", work)
+
+    # -- 重做采集检查（★ 需求一·3） ----------------------------------------
+
+    def on_recheck(self) -> None:
+        """就地重做一次 5 s 全屏采集检查。不动机器人。
+
+        连上设备时已经自动做过一次；没通过就会禁止一切运动（见
+        ``ExperimentSession.require_capture_check``）。现场改完曝光 / 帧率 / 换盘
+        之后必须能重测，否则只能重启工具——所以留这个按钮。
+        """
+
+        def work() -> None:
+            if self.session is None:
+                raise UiError("请先点按钮一（连接设备并到达实验姿态）。")
+            session = self.session
+            summary = session.run_connection_check()
+            for line in summary.get("lines") or []:
+                self.append_log(line)
+            if summary.get("ok"):
+                measured = summary.get("measured") or {}
+                write_mbps = summary.get("write_mbps")
+                shown = "没量到" if write_mbps is None else f"{float(write_mbps):.1f} MB/s"
+                self.append_log(
+                    "采集检查通过：可以继续。后面每一组的磁盘峰值都用这次实测分辨率与帧率算。"
+                )
+                self.append_log(
+                    f"（实测 {measured.get('width')}×{measured.get('height')} @ "
+                    f"{float(measured.get('fps') or 0.0):.2f} fps，写盘 {shown}，"
+                    f"测试 RAW 已按规矩删除。）"
+                )
+            else:
+                self.append_log(
+                    "采集检查**没有通过**：机械臂运动已被禁止。请按上面的原因逐条处理后"
+                    "（曝光/帧率/相机连接/换更快的目标盘），再点一次这个按钮重测。"
+                )
+
+        self._run_task("重做 5 s 全屏采集检查（不动机器人）", work)
 
     # -- 按钮二 -----------------------------------------------------------
 
@@ -1126,6 +1210,14 @@ class ParameterDialog:
             return
         if changes:
             self.app.append_log("参数已更新：\n  " + "\n  ".join(changes))
+            # 改完参数立刻重报一次"RAW 会不会被删"和整场规模——
+            # 这两件事都跟着参数走，界面上的字必须和刚落盘的内容一致（需求三）。
+            self.app.append_log(pipeline_status_line(self.app.config))
+            try:
+                for line in planned_scale_lines(self.app.config):
+                    self.app.append_log(line)
+            except Exception as exc:  # pragma: no cover - 估算失败不该拦住界面
+                self.app.append_log(f"（规模估算没算出来，不影响使用：{exc}）")
             self.app.set_status(f"参数已更新（{len(changes)} 项）")
         else:
             self.app.append_log("参数没有变化。")
@@ -1140,7 +1232,7 @@ class ParameterDialog:
 
 def preflight(config: AppConfig) -> list[str]:
     """启动前的检查，返回人可读的几行。只报事实，不阻止启动。"""
-    lines: list[str] = []
+    lines: list[str] = [pipeline_status_line(config)]
     try:
         ok, message = check_free_disk(
             config.resolve_output_root(), float(config.paths.min_free_disk_gb)

@@ -62,7 +62,7 @@
     "commanded_delta_deg": 0.05,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 253
+    "frame_count": 197
   },
   {
     "event_id": "pretest-J1-a0p05-d+1-r02-move-to",
@@ -75,7 +75,7 @@
     "commanded_delta_deg": 0.05,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 253
+    "frame_count": 197
   },
   {
     "event_id": "pretest-J1-a0p05-d-1-r01-move-to",
@@ -88,7 +88,7 @@
     "commanded_delta_deg": -0.05,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 253
+    "frame_count": 197
   },
   {
     "event_id": "pretest-J1-a0p05-d-1-r02-move-to",
@@ -101,7 +101,7 @@
     "commanded_delta_deg": -0.05,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 253
+    "frame_count": 197
   },
   {
     "event_id": "pretest-J1-a0p2-d+1-r01-move-to",
@@ -114,7 +114,7 @@
     "commanded_delta_deg": 0.2,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 295
+    "frame_count": 197
   },
   {
     "event_id": "pretest-J1-a0p2-d+1-r02-move-to",
@@ -127,7 +127,7 @@
     "commanded_delta_deg": 0.2,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 295
+    "frame_count": 197
   },
   {
     "event_id": "pretest-J1-a0p2-d-1-r01-move-to",
@@ -140,7 +140,7 @@
     "commanded_delta_deg": -0.2,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 295
+    "frame_count": 197
   },
   {
     "event_id": "pretest-J1-a0p2-d-1-r02-move-to",
@@ -153,7 +153,7 @@
     "commanded_delta_deg": -0.2,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 295
+    "frame_count": 197
   },
   {
     "event_id": "formal_a-J1-a0p05-d+1-r01-move-up01",
@@ -166,7 +166,7 @@
     "commanded_delta_deg": 0.05,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 153
+    "frame_count": 125
   },
   {
     "event_id": "formal_a-J1-a0p05-d+1-r01-move-up02",
@@ -179,6 +179,6 @@
     "commanded_delta_deg": 0.1,
     "settle_ended_by": "settled",
     "dropped_ratio": 0.0,
-    "frame_count": 153
+    "frame_count": 125
   }
 ]

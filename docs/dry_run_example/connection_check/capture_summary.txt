@@ -3,11 +3,11 @@ UR10 相机高速 RAW 采集摘要
 说明：本摘要只统计高速采集阶段是否接住相机输出的原始图像帧。
       采集缺帧来自相机 frame_id 断号，表示这些帧没有进入 frames.raw。
 ------------------------------------------------------------------------
-生成时间：2026-09-24T00:33:49
-实际保存的原始图像帧数：197
-相机帧号起点：1890
-相机帧号终点：2086
-按首末 frame_id 推算应出现的相机帧数：197
+生成时间：2026-09-24T00:33:10
+实际保存的原始图像帧数：662
+相机帧号起点：0
+相机帧号终点：661
+按首末 frame_id 推算应出现的相机帧数：662
 采集阶段未保存的相机帧数：0
 采集缺帧率：0.00%
 frame_id 连续比例：100.00%
@@ -15,12 +15,12 @@ frame_id 断号事件次数：0
 最大连续缺失帧数：0
 actual_camera_fps：132.230 fps（来源：dry_run.synthetic）
 analysis_time_s 来源：frame_id_fps_fallback
-missing_frames.csv：C:\Users\PC\AppData\Local\Temp\dr_snap3\dryrun_example\segments\pretest-J1-a0p01-d-1-r01-move-to\missing_frames.csv
+missing_frames.csv：C:\Users\PC\AppData\Local\Temp\dr_snap3\dryrun_example\connection_check\missing_frames.csv
 根据 frame_id 和 host_ns 推算的相机帧率：132.230 fps
 host_ns 只用于电脑侧对时，不作为 raw_capture 离线频谱分析时间轴。
-每帧保存/复制平均耗时：0.179 ms
-每帧保存/复制 P95：0.368 ms
-每帧保存/复制最大值：0.772 ms
-采集期间总耗时：1.482 s
+每帧保存/复制平均耗时：0.184 ms
+每帧保存/复制 P95：0.338 ms
+每帧保存/复制最大值：0.550 ms
+采集期间总耗时：4.999 s
 采集结束后的 RAW 收尾耗时：N/A ms
-RAW 文件大小：34041600 bytes
+RAW 文件大小：114393600 bytes

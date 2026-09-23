@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from .config import JOINT_NAMES, AppConfig
 from .kinematics import JOINT_LIMITS_DEG, check_joint_in_limits
@@ -944,25 +944,41 @@ def planned_plans(config: AppConfig, *, include_formal: bool = True) -> list[Mot
     return plans
 
 
-def planned_scale_lines(config: AppConfig) -> list[str]:
+def planned_scale_lines(config: AppConfig, *, measured: Any = None) -> list[str]:
     """整场实验预计要花多久、占多少盘。**估算**，不是承诺。
 
     这些数偏保守：运动时间按梯形速度规划算，停稳按判据的保持时间算，
     但真机上控制器怎么规划、现场要不要中途重来，都会让它变长。
     写在开始之前，是为了让人知道"现在按下去要占用多久"——而不是
     按下之后才发现是几十分钟。
+
+    ★ v1.0.3：``measured`` 给了就用**实测**的分辨率和帧率算（连上设备之后那次
+    5 s 全屏采集检查的结果）。交付默认的 1936×1096 只是名义值——相机实际出的
+    画面尺寸和帧率都可能不一样，而磁盘估算差一点点就是"这一组能不能开始"。
     """
-    from .config import estimate_capture_seconds, estimate_disk_gb
+    from .config import MeasuredCapture, estimate_capture_seconds, estimate_disk_gb
 
     plans = planned_plans(config)
-    seconds = estimate_capture_seconds(config, plans)
-    size_gb = estimate_disk_gb(config, seconds)
-    width, height = config.effective_camera_size()
+    seconds = estimate_capture_seconds(config, plans, measured=measured)
+    size_gb = estimate_disk_gb(config, seconds, measured=measured)
+    width, height = config.effective_camera_size(measured)
+    fps = config.effective_fps(measured)
+    origin = (
+        "实测（连接设备后的 5 s 全屏采集检查）"
+        if isinstance(measured, MeasuredCapture)
+        else "配置里的名义值"
+    )
     lines = [
         f"整场实验规模（按当前配置估算）：录制约 {seconds / 60.0:.0f} 分钟"
         f"（{seconds:.0f} 秒），RAW 约 {size_gb:.1f} GB"
-        f"（{width}×{height} @ {config.effective_fps():.2f} fps）。"
+        f"（全屏 {width}×{height} @ {fps:.2f} fps，尺寸与帧率取自{origin}）。"
     ]
+    if config.camera.resolved_analysis_roi() is not None:
+        lines.append(
+            f"（整场估算按**整幅**算：camera.analysis_roi="
+            f"{list(config.camera.analysis_roi or config.camera.roi or [])} "
+            "只影响机器人停住之后的离线识别，不改变 RAW 的大小。）"
+        )
     missing = [
         joint
         for joint in config.pretest.joints

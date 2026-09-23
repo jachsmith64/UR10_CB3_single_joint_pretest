@@ -149,10 +149,11 @@ def _eccentric_signal(
     r_rms = r_rms_px_cached()
     eccentric_px = float(eccentricity_mm) / MM_PER_PIXEL
     chord_px = 2.0 * eccentric_px * math.sin(math.radians(abs(rotation_deg)) / 2.0)
-    frames = [
-        _frame(rotation_deg=0.0, shift_x_px=0.0, shift_y_px=0.0, r_rms_px=r_rms)
-    ]
-    frames.append(
+    # ★ 窗口里的每一帧都**已经到位**（保持段），所以每一帧的几何量一样。
+    # 以前这里放了一帧名义位姿（转角 0、位移 0）当"参考帧"：那是把参考帧混进了
+    # 运动窗口。深度取窗口均值，混一帧名义位姿会把均值（也就是深度）拉走一半，
+    # 而那一半跟"转了多少"毫无关系。
+    return [
         _frame(
             rotation_deg=float(rotation_deg),
             shift_x_px=chord_px,
@@ -160,8 +161,8 @@ def _eccentric_signal(
             r_rms_px=r_rms,
             scale=float(scale),
         )
-    )
-    return frames
+        for _ in range(3)
+    ]
 
 
 def _estimate(tmp_path: Path, **kwargs):
