@@ -1,0 +1,16 @@
+============================================================
+ 干运行示例结束
+============================================================
+
+请看 outputs\dryrun_example\analysis\pretest_report.txt
+—— 推荐步长、每条判据为什么通过/不通过，都写在那里面。
+
+再看一眼别的东西是否齐全：
+  outputs\dryrun_example\run_manifest.json
+  outputs\dryrun_example\segments\  （每个动作一个子目录）
+
+想清理这次示例占的空间（原始帧可能有几百 MB）：
+  直接删掉 outputs\dryrun_example\segments\*\frames.raw 即可，
+  文本记录和样例图都可以留着。
+
+下一步：双击 run_ui.bat 打开界面，按 ①②③ 三个按钮往下走。

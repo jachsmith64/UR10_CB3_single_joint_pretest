@@ -288,6 +288,18 @@ def build_approach_plan(
             f"到位 {index}/{points}：整体走 {fraction * 100:.0f}%，"
             f"本步最大变化在 J{biggest + 1} {delta_from_previous[biggest]:+.4f}°"
         )
+        moving_from_current = [
+            f"J{i + 1}{delta_from_current[i]:+.4f}°"
+            for i in range(6)
+            if abs(delta_from_current[i]) > 1e-9
+        ]
+        if moving_from_current:
+            describe = f"{describe}；相对当前位姿 " + "、".join(moving_from_current)
+        else:
+            # 当前姿态已经就是实验姿态（干运行每次都这样，真机上偶尔也会碰上）：
+            # 这时"相对当前位姿 "后面一个关节都列不出来，会留下一句读不通的
+            # 半截话。宁可明说"不需要动"。
+            describe = f"{describe}；相对当前位姿不需要移动（已经在实验姿态上）"
         plan.steps.append(
             PlannedStep(
                 event=_event(
@@ -305,14 +317,7 @@ def build_approach_plan(
                 settle_required=True,
                 hold_s=hold_s,
                 delta_from_nominal_deg=delta_from_current,
-                label=(
-                    f"{describe}；相对当前位姿 "
-                    + "、".join(
-                        f"J{i + 1}{delta_from_current[i]:+.4f}°"
-                        for i in range(6)
-                        if abs(delta_from_current[i]) > 1e-9
-                    )
-                ),
+                label=describe,
             )
         )
     return plan
@@ -900,3 +905,78 @@ def nominal_offset_summary(
         if not math.isclose(deltas[index], 0.0, abs_tol=1e-9)
     ]
     return "、".join(parts) if parts else "与名义位姿相同"
+
+
+# --------------------------------------------------------------------------
+# 开跑之前的规模估算
+# --------------------------------------------------------------------------
+
+
+def planned_plans(config: AppConfig, *, include_formal: bool = True) -> list[MotionPlan]:
+    """按当前配置列出"整场实验"要跑的所有计划（不执行、不发命令）。
+
+    只用配置，不需要连接任何设备——所以界面一打开就能把它算出来显示给人看。
+    正式实验只算**已经填了步长**的关节：没填步长就没法生成组A/组B 的计划，
+    这本身就是一条要显示给用户看的信息。
+    """
+    nominal = config.robot.nominal_joint_deg
+    durations = config.effective_durations()
+    plans = [
+        build_static_plan(nominal, duration_s=float(durations["static"])),
+        build_quick_probe_plan(
+            nominal,
+            config.pretest.joints,
+            probe_deg=float(config.pretest.quick_probe_deg),
+            hold_s=float(config.camera.hold_s),
+            return_settle_s=float(config.pretest.return_before_settle_s),
+        ),
+        build_pretest_plan(config, nominal),
+    ]
+    if include_formal:
+        for joint in config.pretest.joints:
+            step = config.formal.step_deg.get(joint)
+            if not step:
+                continue
+            if config.formal.enable_group_a:
+                plans.append(build_formal_group_a(config, nominal, joint, float(step)))
+            if config.formal.enable_group_b:
+                plans.append(build_formal_group_b(config, nominal, joint, float(step)))
+    return plans
+
+
+def planned_scale_lines(config: AppConfig) -> list[str]:
+    """整场实验预计要花多久、占多少盘。**估算**，不是承诺。
+
+    这些数偏保守：运动时间按梯形速度规划算，停稳按判据的保持时间算，
+    但真机上控制器怎么规划、现场要不要中途重来，都会让它变长。
+    写在开始之前，是为了让人知道"现在按下去要占用多久"——而不是
+    按下之后才发现是几十分钟。
+    """
+    from .config import estimate_capture_seconds, estimate_disk_gb
+
+    plans = planned_plans(config)
+    seconds = estimate_capture_seconds(config, plans)
+    size_gb = estimate_disk_gb(config, seconds)
+    width, height = config.effective_camera_size()
+    lines = [
+        f"整场实验规模（按当前配置估算）：录制约 {seconds / 60.0:.0f} 分钟"
+        f"（{seconds:.0f} 秒），RAW 约 {size_gb:.1f} GB"
+        f"（{width}×{height} @ {config.effective_fps():.2f} fps）。"
+    ]
+    missing = [
+        joint
+        for joint in config.pretest.joints
+        if not config.formal.step_deg.get(joint)
+    ]
+    if missing:
+        lines.append(
+            "上面这个数**没有算**正式实验里还没填步长的关节："
+            + "、".join(missing)
+            + "。填好步长之后再看一次这个数。"
+        )
+    else:
+        lines.append("上面这个数已经把组A/组B 的正式实验算进去了。")
+    lines.append(
+        "这只是估算：真机上控制器怎么规划、现场要不要重来，都会让它变长。"
+    )
+    return lines

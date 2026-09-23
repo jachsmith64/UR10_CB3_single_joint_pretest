@@ -47,6 +47,7 @@ from .config import (
     JOINT_NAMES,
     AppConfig,
     check_free_disk,
+    check_plan_disk,
     trial_plan_summary,
 )
 from .joint_space import (
@@ -319,9 +320,23 @@ class ExperimentSession:
         self.engine = CaptureEngine(
             config, self.pump, synthetic=config.mode == "dry_run"
         )
+        # 回放模式下机器人不发任何命令，它只回答"这一刻关节角是多少"。
+        # 答案来自这份历史数据所属运行目录里的 robot_states.csv；
+        # 找不到就传空表，回放会如实报"没有关节角记录"，而不是编一组角出来。
+        records: list[Any] | None = None
+        if config.mode == "replay" and config.replay_source:
+            from .replay import load_joint_records
+
+            records = list(load_joint_records(config.replay_source))
+            self.hooks.log(
+                f"回放：从 {config.replay_source} 所在的运行目录读到 "
+                f"{len(records)} 条关节角记录。"
+                + ("" if records else "（没有记录，第一层分析会标为无法评估。）")
+            )
         self.robot = make_robot(
             config,
             world=self.bundle.world,
+            records=records,
             confirm=lambda label: self._confirm_motion(label),
             precheck=self.hooks.precheck,
         )
@@ -497,6 +512,24 @@ class ExperimentSession:
             limit_margin_deg=1.0,
         )
 
+    def approach_needed(self, tolerance_deg: float = 0.02) -> bool:
+        """当前实际角与实验姿态差得远不远。只读实际关节角，不发任何命令。
+
+        阈值取得很小（默认 0.02°）：这里是"要不要再走一遍到位过程"的判断，
+        宁可多走一遍，也不要在其实没到位的时候以为已经站在实验姿态上了。
+        返回 True 就说明**需要**逐步走到位。
+        """
+        if self.robot is None:
+            raise ExperimentError("会话还没打开：请先调用 open()。")
+        current = self.robot.read_state().actual_q_deg
+        delta = joint_delta(current, self.config.robot.nominal_joint_deg)
+        biggest = max(abs(float(value)) for value in delta)
+        self.hooks.log(
+            f"当前姿态与实验姿态的最大偏差：{biggest:.4f}°"
+            f"（超过 {float(tolerance_deg):g}° 就需要重新逐步到位）"
+        )
+        return biggest > float(tolerance_deg)
+
     def run_approach(self) -> SessionResult:
         """逐步走到实验姿态：每一步都确认、每步后给一张预览图。"""
         if self.robot is None or self.pump is None or self.run is None:
@@ -513,7 +546,7 @@ class ExperimentSession:
             if step.target_joint_deg is None:
                 continue
             result.add(
-                f"{step.label}：相对实验姿态 "
+                f"{step.label}；到位后相对实验姿态 "
                 + nominal_offset_summary(config.robot.nominal_joint_deg, step.target_joint_deg)
             )
         if self.run is not None:
@@ -575,6 +608,9 @@ class ExperimentSession:
                 frames_per_preview, stop_requested=self.hooks.stop_requested
             )
             preview, check = self._preview_and_check(packet.frame, step.event.event_id, index)
+            if preview is not None:
+                # 记下来：到位过程一共落了哪几张预览图，"现场回头看"时要有据可查。
+                self.approach_frames.append(preview)
             result.add(f"第 {index} 步画面检查：{check}")
             self.hooks.log(f"第 {index} 步画面检查：{check}")
             if preview is not None and self.hooks.on_preview is not None:
@@ -668,6 +704,7 @@ class ExperimentSession:
         duration = float(config.effective_durations()["static"])
         plan = build_static_plan(config.robot.nominal_joint_deg, duration_s=duration)
         step = plan.steps[0]
+        self._require_disk([plan], "静态基线采集")
         self.hooks.log(
             f"[静态基线] 保持不动录 {duration:.1f} s："
             "这段时间里不要碰相机、台面和机械臂。"
@@ -718,6 +755,27 @@ class ExperimentSession:
             # 用**这一帧的时间戳**给 RTDE 行打时间，两边就落在同一根时间轴上。
             self.recorder.sample(host_ns=int(packet.host_ns))
 
+    def _require_disk(self, plans: Sequence[Any], what: str) -> list[str]:
+        """开跑之前，按**这一次要跑的计划**检查磁盘；不够就拒绝开始这一段。
+
+        为什么不是"连设备时查一次就完了"：连设备时只知道一个固定门槛，
+        而真正的占用取决于"这一段要录几分钟、每帧多大"。而且一段正式实验
+        是几十分钟，中途被别的进程写满磁盘是很现实的事——所以每一段开始前
+        都按那一段自己的计划重新估一次，宁可多花一次系统调用。
+
+        ``plans`` 传计划对象（有 ``steps``）或步骤序列都行。
+        """
+        ok, lines = check_plan_disk(self.config, plans)
+        for line in lines:
+            self.hooks.log(f"[磁盘] {line}")
+        if self.run is not None:
+            self.run.events.write("disk_checked", what=what, ok=bool(ok), lines=lines)
+        if not ok:
+            raise ExperimentError(
+                f"{what}没有开始：磁盘空间不够。\n" + "\n".join(lines)
+            )
+        return lines
+
     # ------------------------------------------------------------------
     # 按钮二（B）：快速几何检查
     # ------------------------------------------------------------------
@@ -734,6 +792,7 @@ class ExperimentSession:
             hold_s=float(config.camera.hold_s),
             return_settle_s=float(config.pretest.return_before_settle_s),
         )
+        self._require_disk([plan], "快速几何检查")
         result = SessionResult(title="快速几何检查")
         failed_joints: list[str] = []
         plans = iter_segment_plans(plan)
@@ -982,6 +1041,7 @@ class ExperimentSession:
         plans = iter_segment_plans(plan)
         statistics = [p for p in plans if p.statistics_event_id]
         result = SessionResult(title="三档微动预实验")
+        self._require_disk([plan], "三档微动预实验")
         result.add(
             f"计划：{len(statistics)} 次统计试验（"
             f"{len(config.pretest.joints)} 个关节 × {len(config.pretest.amplitudes_deg)} 档幅度"
@@ -990,25 +1050,30 @@ class ExperimentSession:
         )
         self.hooks.log(result.lines[-1])
         triggers = self._joint_triggers(plans)
-        for position, segment_plan in enumerate(plans, start=1):
-            self._check_stop()
-            joint = segment_plan.primary.event.joint
-            if trigger := triggers.get(position):
-                if not self.hooks.ask(trigger):
-                    raise MotionAborted(f"操作者没有确认进入 {joint} 的预实验。")
-                # 同上：关节级确认就是本关节其余动作的通行证。
-                if joint:
-                    self._confirmed.add(joint)
-            record = self._run_segment(
-                segment_plan, kind="pretest", position=position, total=len(plans)
-            )
-            if record is None:
-                continue
-            result.segments.append(record)
-            self._record_trial(segment_plan, record)
-            self.hooks.log(record.summary_line())
-        result.add(f"预实验采集完成：{len(result.segments)} 段。")
-        self._write_trial_plan()
+        try:
+            for position, segment_plan in enumerate(plans, start=1):
+                self._check_stop()
+                joint = segment_plan.primary.event.joint
+                if trigger := triggers.get(position):
+                    if not self.hooks.ask(trigger):
+                        raise MotionAborted(f"操作者没有确认进入 {joint} 的预实验。")
+                    # 同上：关节级确认就是本关节其余动作的通行证。
+                    if joint:
+                        self._confirmed.add(joint)
+                record = self._run_segment(
+                    segment_plan, kind="pretest", position=position, total=len(plans)
+                )
+                if record is None:
+                    continue
+                result.segments.append(record)
+                self._record_trial(segment_plan, record)
+                self.hooks.log(record.summary_line())
+            result.add(f"预实验采集完成：{len(result.segments)} 段。")
+        finally:
+            # 中止时也要落盘。已经采到的段必须登记进 trial_plan：
+            # 采集目录里 RAW、时间戳、元数据都还在，但没有 trial_plan
+            # 分析侧就不知道哪些目录算统计试验——原始数据没丢，却用不上。
+            self._write_trial_plan()
         return result
 
     def _record_trial(self, segment_plan: SegmentPlan, record: SegmentCapture) -> None:
@@ -1076,39 +1141,45 @@ class ExperimentSession:
             raise ExperimentError("配置里关掉了组 B（formal.enable_group_b = false）。")
         steps = dict(step_deg or config.formal.step_deg)
         result = SessionResult(title=f"正式实验 组{group.upper()}")
-        for joint in config.pretest.joints:
-            step = steps.get(joint)
-            if not step:
-                result.add(f"{joint}：没有填步长，跳过。")
-                continue
-            self._check_stop()
-            plan = self.formal_plan(group, joint, float(step))
-            plans = iter_segment_plans(plan)
-            result.add(
-                f"组{group.upper()} {joint} Δ={step}°：{capture_segment_count(plans)} 段采集"
-                f"（阶梯 {config.formal.staircase_n} 级，重复 {config.formal.repeats} 遍）"
-            )
-            self.hooks.log(result.lines[-1])
-            if not self.hooks.ask(
-                f"[组{group.upper()}] 开始 {joint} 的正式实验 Δ={step}°。\n\n"
-                "理论范围检查已通过，但碰撞状态仍是 unknown。"
-            ):
-                raise MotionAborted(f"操作者没有确认开始 组{group.upper()} {joint}。")
-            self._confirmed.add(joint)
-            for position, segment_plan in enumerate(plans, start=1):
-                self._check_stop()
-                record = self._run_segment(
-                    segment_plan,
-                    kind=f"formal_{group.lower()}",
-                    position=position,
-                    total=len(plans),
-                )
-                if record is None:
+        try:
+            for joint in config.pretest.joints:
+                step = steps.get(joint)
+                if not step:
+                    result.add(f"{joint}：没有填步长，跳过。")
                     continue
-                result.segments.append(record)
-                self._record_trial(segment_plan, record)
-        self._write_trial_plan()
-        result.add(f"组{group.upper()} 采集完成：{len(result.segments)} 段。")
+                self._check_stop()
+                plan = self.formal_plan(group, joint, float(step))
+                plans = iter_segment_plans(plan)
+                # 正式实验一段就是几十分钟，所以按**这一个关节**的计划单独查磁盘：
+                # 前面几个关节跑完可能已经把盘填掉一大截了。
+                self._require_disk([plan], f"组{group.upper()} {joint} 正式实验")
+                result.add(
+                    f"组{group.upper()} {joint} Δ={step}°：{capture_segment_count(plans)} 段采集"
+                    f"（阶梯 {config.formal.staircase_n} 级，重复 {config.formal.repeats} 遍）"
+                )
+                self.hooks.log(result.lines[-1])
+                if not self.hooks.ask(
+                    f"[组{group.upper()}] 开始 {joint} 的正式实验 Δ={step}°。\n\n"
+                    "理论范围检查已通过，但碰撞状态仍是 unknown。"
+                ):
+                    raise MotionAborted(f"操作者没有确认开始 组{group.upper()} {joint}。")
+                self._confirmed.add(joint)
+                for position, segment_plan in enumerate(plans, start=1):
+                    self._check_stop()
+                    record = self._run_segment(
+                        segment_plan,
+                        kind=f"formal_{group.lower()}",
+                        position=position,
+                        total=len(plans),
+                    )
+                    if record is None:
+                        continue
+                    result.segments.append(record)
+                    self._record_trial(segment_plan, record)
+            result.add(f"组{group.upper()} 采集完成：{len(result.segments)} 段。")
+        finally:
+            # 同 run_pretest：中途中止也要把已采到的段登记进 trial_plan。
+            self._write_trial_plan()
         return result
 
     # ------------------------------------------------------------------

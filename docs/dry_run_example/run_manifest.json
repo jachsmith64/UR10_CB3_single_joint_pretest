@@ -1,0 +1,86 @@
+{
+  "run_kind": "dry_run",
+  "run_dir": "C:\\Users\\PC\\Desktop\\code\\UR10_CB3_single_joint_pretest_v1\\outputs\\dryrun_example",
+  "created_at": "2026-09-23T17:21:01",
+  "tool_version": "1.0.0",
+  "mode": "dry_run",
+  "synthetic": true,
+  "collision_status": "unknown",
+  "disk_check": "可用磁盘空间 65.15 GB，满足要求。",
+  "summary": {
+    "mode": "dry_run",
+    "nominal_joint_deg": [
+      -53.8365,
+      -175.6992,
+      148.2887,
+      -137.4699,
+      -17.512,
+      -112.4909
+    ],
+    "amplitudes_deg": [
+      0.01,
+      0.05,
+      0.2
+    ],
+    "repeats_per_direction": 2,
+    "static_duration_s": 15.0,
+    "joints": [
+      "J1"
+    ],
+    "centroid_joints": [
+      "J1",
+      "J2",
+      "J3",
+      "J4",
+      "J5"
+    ],
+    "rotation_joints": [
+      "J6"
+    ],
+    "rtde_record_hz": 125.0
+  },
+  "plan": {
+    "joints": [
+      "J1"
+    ],
+    "actions_per_joint": 12,
+    "total_actions": 12,
+    "amplitudes_deg": [
+      0.01,
+      0.05,
+      0.2
+    ],
+    "repeats_per_direction": 2
+  },
+  "amplitudes_deg": [
+    0.01,
+    0.05,
+    0.2
+  ],
+  "formal_steps_deg": {
+    "J1": 0.05
+  },
+  "camera_hint": [
+    "摆法：horizontal（水平放置）",
+    "工作距离：约 675 mm",
+    "高度：相机与棋盘格中心大致等高",
+    "水平方位角：约 33.3°",
+    "棋盘格与相机正视方向偏差：约 14.75°",
+    "★ 这些只是摆放提示；collision_status = unknown，碰撞未经验证。"
+  ],
+  "reused_modules": {
+    "重点复用（一行未改，在 src/sj_pretest/vendor/）": [
+      "camera.py —— 海康相机采集、RAW 落盘格式、缺帧记账、棋盘格检测与亚像素细化、rigid motion 估计",
+      "robot.py —— RTDE 连接、Dashboard 安全检查、停止、脚本收尾",
+      "analyze.py —— 离线分析里可复用的统计与绘图工具",
+      "calibration.py —— 棋盘格标定相关工具",
+      "config.py —— 被复用代码的参数面（本工具通过 src/sj_pretest/bridge.py 在运行时改属性，不改文件）"
+    ],
+    "新写的（本工具特有）": [
+      "关节空间 moveJ 微动与停稳判据（被复用代码只发过 moveL）",
+      "相位感知的采集（运动前/运动/保持/回程/运动后五段在同一段时间轴上）",
+      "三层分析与步长推荐判据",
+      "三个主按钮的一体化界面与逐步人工确认"
+    ]
+  }
+}

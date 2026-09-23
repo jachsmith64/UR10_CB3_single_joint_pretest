@@ -132,7 +132,10 @@ def _non_negative(value: float, where: str) -> float:
 class RobotConfig:
     """UR10 CB3 连接与关节运动参数。"""
 
-    ip: str = "192.168.1.10"
+    #: 默认值取自被复用的旧预实验代码（``vendor/config.py`` 的 ``ROBOT_HOST``），
+    #: 那一套是在真机上跑通过的。现场若不是这个地址，请在界面的参数面板里改，
+    #: 或者另存一份 ``configs/local_site.json``（该文件名已在 .gitignore 里）。
+    ip: str = "192.168.125.12"
     #: 默认推荐姿态（归一化到 ±180°）。
     nominal_joint_deg: list[float] = field(
         default_factory=lambda: list(DEFAULT_NOMINAL_JOINT_DEG)
@@ -508,6 +511,12 @@ class ThresholdConfig:
     quick_probe_min_snr: float = 3.0
     #: 快速几何检查里"方向大致符合理论"的容差（度）。
     quick_probe_direction_tol_deg: float = 45.0
+    #: 一个窗口里至少要凑够多少**有效帧**才允许把它当成"均值"。
+    #: 第二层的窗口是"保持段的后半段"，本来就不长（默认 0.4 s 的一半），
+    #: 离线分析的步长一大，窗口里就剩一两帧——那时候报出来的数字不是均值，
+    #: 是一次抽样。这一条**不是**放行/拦停的门槛（不参与推荐步长的判据），
+    #: 而是提示"这个数不可信、请把步长调小重算"，所以不会把试验判成无效。
+    min_window_frames: int = 5
 
     def validate(self) -> None:
         where = "thresholds"
@@ -585,6 +594,11 @@ class ThresholdConfig:
             raise ConfigError(
                 f"{where}.quick_probe_direction_tol_deg 必须在 0～180，收到 {probe_tol}"
             )
+        frames = _as_int(self.min_window_frames, f"{where}.min_window_frames")
+        if frames < 2:
+            raise ConfigError(
+                f"{where}.min_window_frames 至少 2（1 帧算不出离散度），收到 {frames}"
+            )
 
 
 @dataclass
@@ -604,7 +618,12 @@ class FormalConfig:
     #: 是否跑组 A、组 B。
     enable_group_a: bool = True
     enable_group_b: bool = True
-    #: 正式实验用的速度/加速度（默认沿用预实验，界面可改）。
+    #: 正式实验用的速度/加速度。★ 故意比预实验更慢（预实验默认 0.5 °/s）：
+    #: 组A 的行程是预实验的 N 倍（5 级阶梯 = 5×步长），运动本身激起的振动
+    #: 更容易混进"几何"里，所以正式实验走得更慢。代价是慢——0.05 °/s 下
+    #: 0.2° 的一级要走近 3 s，一个关节的组A 大约两分半。嫌慢可以在界面的
+    #: 参数面板里改，上限仍是 ``robot.max_speed_deg_s``（5.0 °/s）；
+    #: 改快了请自己承担"振动与几何分不开"的判读代价。
     speed_deg_s: float = 0.05
     accel_deg_s2: float = 0.1
     #: 正式实验前必须做的名义运动学范围检查，超出预实验已验证范围就警告。
@@ -966,7 +985,7 @@ class AppConfig:
 
     def resolve_output_root(self) -> Path:
         """输出根目录：相对路径按"当前工作目录"解析，绝对路径原样使用。"""
-        root = Path(self.output_root if False else self.paths.output_root).expanduser()
+        root = Path(self.paths.output_root).expanduser()
         return root if root.is_absolute() else (Path.cwd() / root)
 
     def camera_hint_lines(self) -> list[str]:
@@ -1034,6 +1053,12 @@ def trapezoid_seconds(distance_deg: float, speed_deg_s: float, accel_deg_s2: flo
     return distance / speed + speed / accel
 
 
+#: 正式实验的阶段名。正式计划走的是 ``formal.speed_deg_s``，比预实验慢得多，
+#: 所以估时长必须挑对速度——否则会把一小时估成几分钟，磁盘门槛就形同虚设。
+#: 这里用字面量而不是从 joint_space 导入，是因为 joint_space 反过来要导入本模块。
+_FORMAL_STAGES = ("formal_a", "formal_b")
+
+
 def estimate_capture_seconds(config: AppConfig, plans: Iterable[Any]) -> float:
     """估算这些计划一共要录制多少秒（用来算磁盘占用）。
 
@@ -1041,10 +1066,13 @@ def estimate_capture_seconds(config: AppConfig, plans: Iterable[Any]) -> float:
     保持 → 回程 → 运动后记录。纯等待步（组间等待）不录制。
     """
     durations = config.effective_durations()
-    speed, accel = config.effective_speed()
     total = 0.0
     for plan in plans:
         steps = list(getattr(plan, "steps", plan))
+        stage = next(
+            (str(step.event.stage) for step in steps if step.is_motion), None
+        )
+        speed, accel = config.effective_speed(formal=stage in _FORMAL_STAGES)
         index = 0
         while index < len(steps):
             step = steps[index]
@@ -1115,7 +1143,46 @@ def disk_estimate_lines(config: AppConfig, plans: Iterable[Any]) -> list[str]:
             "★ 当前没有设置 ROI 裁剪：满幅 1936×1096 在 132 fps 下约 280 MB/s，"
             "是磁盘占用的第一主导项。现场建议把 camera.roi 填成包住棋盘格的一块。"
         )
+    if not config.camera.save_raw:
+        lines.append("（当前 save_raw=False，只存统计和时间戳，不存原始帧。）")
     return lines
+
+
+def check_plan_disk(
+    config: AppConfig,
+    plans: Iterable[Any],
+    *,
+    headroom: float = 1.15,
+) -> tuple[bool, list[str]]:
+    """按**这一次要跑的计划**算占用，再和可用空间比。返回 (是否够, 中文说明)。
+
+    为什么不能只看 ``paths.min_free_disk_gb``：那是个固定门槛（默认 2 GB），
+    而真实预实验 + 正式实验的 RAW 是几十到几百 GB 的量级——满幅 1936×1096
+    在 132 fps 下约 280 MB/s，跑一小时就是约 1 TB。固定门槛定在 2 GB，
+    等于没有门槛：磁盘写满的时候人已经离开一小时了，采到的数据还是断的。
+
+    所以这里按计划算"接下来这一段要多少"，乘一个余量（默认 15%），
+    再和"绝对下限"取较大者。不够就返回 False，由调用方**拒绝开始**这一段。
+    """
+    lines = disk_estimate_lines(config, plans)
+    seconds = estimate_capture_seconds(config, plans)
+    size_gb = estimate_disk_gb(config, seconds)
+    need_gb = max(float(config.paths.min_free_disk_gb), size_gb * float(headroom))
+    ok, message = check_free_disk(config.resolve_output_root(), need_gb)
+    if ok:
+        lines.append(
+            f"磁盘检查：{message}（本段按计划需要约 {need_gb:.2f} GB，"
+            f"含 {int((headroom - 1) * 100)}% 余量）"
+        )
+    else:
+        lines.append(
+            f"磁盘检查未通过：{message}"
+            f"本段按计划需要约 {need_gb:.2f} GB。"
+            "可做的三件事：把 camera.roi 裁到刚好包住棋盘格；"
+            "或把 camera.save_raw 关掉（只留时间戳与统计）；"
+            "或换一个更大的输出盘。"
+        )
+    return ok, lines
 
 
 def default_config() -> AppConfig:

@@ -1,0 +1,37 @@
+# UR10 CB3 单关节微动预实验工具 —— 依赖清单
+#
+# 安装方式：双击 install_deps.bat，或在项目根目录执行
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# 说明：本工具自己写的代码只用到 numpy + opencv；下面 scipy / matplotlib / Pillow
+# 是**被复用的旧预实验代码**（src/sj_pretest/vendor/ 里的 camera.py / analyze.py /
+# calibration.py）在导入时就要用的，所以必须一起装，缺了会在导入那一行就报错。
+
+numpy>=1.26
+opencv-python>=4.8
+
+# 被复用模块需要（见上面的说明）
+scipy>=1.11
+matplotlib>=3.8
+Pillow>=10.0
+
+# 仅测试需要
+pytest>=7.4
+
+# ---------------------------------------------------------------------------
+# 下面这些**故意不写在这里**，它们不是 pip 能装的东西：
+#
+#   ur_rtde
+#       真机通信库。dry_run / replay 两个模式一次都不会导入它（自测里专门有一条
+#       断言"整个流程跑完 ur_rtde 没被 import"）。上真机之前再单独装：
+#           .venv\Scripts\python.exe -m pip install ur_rtde
+#       或者用 UR 官方提供的 Python wheel / SDK 装法。
+#
+#   海康 MVS SDK（MvCameraControl）
+#       相机厂商的安装包，装完会有 MVS 的 Python 示例目录；本工具不复制它的
+#       .py 文件，而是把相机序列号 + MVS 示例目录路径填进参数面板，运行时按
+#       路径加载（见 src/sj_pretest/vendor/camera.py 与 bridge.py 的说明）。
+#
+#   两者都缺的状态下，工具照样能跑完 dry_run 和 replay —— 这正是交付默认状态。
+# ---------------------------------------------------------------------------

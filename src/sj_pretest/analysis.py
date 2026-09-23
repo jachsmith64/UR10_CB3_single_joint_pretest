@@ -144,8 +144,17 @@ class TrialMetrics:
     direction_source: str = "theoretical"
     sensitivity_px_per_deg: float | None = None
     sensitivity_source: str = "unknown"
-    #: 视觉信号 ÷ 静态噪声（同一方向的投影噪声）。
+    #: 视觉信号 ÷ 静态噪声。**两条视觉路径都要给这一个数**，但单位随关节不同：
+    #: J1–J5 是"质心投影位移 ÷ 同一方向的投影噪声"（无量纲，两边都是像素）；
+    #: J6 是"二维转角 ÷ 静态转角噪声"（两边都是度，同样无量纲）。
+    #: 设成 None 只有一种情况：静态基线没进分析，或者静态噪声恰为 0。
     snr: float | None = None
+    #: 第二层两个窗口各用了多少**有效帧**。留这两个数是为了让"窗口里到底有几帧"
+    #: 看得见：离线分析的步长一大，保持窗口（本来就只有保持段的一半长）里可能
+    #: 只剩一两帧，这时候报出来的不是均值而是一次抽样——必须先能看见，才谈得上
+    #: 判断这个数能不能用（见 thresholds.min_window_frames）。
+    pre_frames: int = 0
+    steady_frames: int = 0
 
     # -- 第三层：动态残差 -------------------------------------------------
     residual_px: float | None = None
@@ -197,6 +206,8 @@ class TrialMetrics:
             "sensitivity_px_per_deg": _r(self.sensitivity_px_per_deg, 4),
             "sensitivity_source": self.sensitivity_source,
             "snr": _r(self.snr, 4),
+            "pre_frames": self.pre_frames,
+            "steady_frames": self.steady_frames,
             "residual_px": _r(self.residual_px, 5),
             "residual_deg": _r(self.residual_deg, 6),
             "residual_ratio": _r(self.residual_ratio, 4),
@@ -716,6 +727,8 @@ def _fill_vision_layer(
     hold_start, hold_end = hold_window
     steady_start = hold_start + 0.5 * (hold_end - hold_start)
     hold_frames = _window_frames(segment, steady_start, hold_end)
+    metrics.pre_frames = len(pre_frames)
+    metrics.steady_frames = len(hold_frames)
     if not pre_frames or not hold_frames:
         metrics.issues.append("运动前或保持阶段没有有效角点帧，第二层无法计算。")
         return
@@ -744,6 +757,11 @@ def _fill_vision_layer(
         metrics.sensitivity_px_per_deg = None
         if static_noise is not None:
             metrics.static_noise_deg = static_noise.std_rotation_deg
+            # J6 的信噪比用转角比静止时的转角噪声（单位都是度）。
+            # 不这么写的话，J6 的 trials.csv 里 snr 一列会空着，
+            # 看表的人分不清"这条判据不适用于 J6"还是"这一格没算出来"。
+            if metrics.static_noise_deg > 0:
+                metrics.snr = abs(metrics.rotation_deg) / metrics.static_noise_deg
         return
 
     if direction.direction_deg is None:
@@ -849,6 +867,15 @@ def _collect_issues(
         metrics.issues.append(
             "RTDE 等待停稳超时：到时间还在动，这一条不作为“关节已到位”的证据。"
         )
+    if 0 < metrics.steady_frames < thresholds.min_window_frames:
+        # 措辞刻意避开“无法计算”和“超时”：这一条是提醒，不是判废。
+        # 数已经算出来了，只是它是几次抽样的平均，不该拿来下结论。
+        metrics.issues.append(
+            f"保持窗口（后半段）只有 {metrics.steady_frames} 帧有效数据，"
+            f"少于 {thresholds.min_window_frames} 帧：这里报出的数是一两次抽样的结果，"
+            "不是一个可以下结论的均值。数据不用重采——把离线分析的步长调小"
+            "（例如 1～2）再分析一遍即可。"
+        )
     if metrics.rtde_response_ratio is not None and metrics.rtde_response_ratio < (
         thresholds.min_rtde_response_ratio
     ):
@@ -934,16 +961,21 @@ class AmplitudeSummary:
         return good / len(pairs)
 
     def plus_minus_diff(self, accessor) -> float | None:
-        """正负两个方向的平均位移之差（取绝对值）。
+        """正负两个方向的**位移量**之差（取绝对值）。
 
         §七 要求给出 "+/- 差异"：同一个关节、同一个幅度，正走和反走产生的
         画面位移量不一样大，通常就是反向间隙（回程间隙）在作怪。这是小步长
         实验最想知道的事情之一，所以单列，不并进平均值里。
+
+        这里比的是**大小**（两边都取绝对值再相减），不是带符号的两个数相减：
+        带符号相减的话，完全对称的 ±0.4 px 会给出 0.8 px，读起来像是"差了一大截"，
+        而其实两边一模一样。符号对不对由 ``sign_consistency`` 单独判定，
+        不该混进这个数里。
         """
         plus = [accessor(t) for t in self.trials if t.direction > 0]
         minus = [accessor(t) for t in self.trials if t.direction < 0]
-        plus = [v for v in plus if v is not None]
-        minus = [v for v in minus if v is not None]
+        plus = [abs(v) for v in plus if v is not None]
+        minus = [abs(v) for v in minus if v is not None]
         if not plus or not minus:
             return None
         return abs(statistics.fmean(plus) - statistics.fmean(minus))
@@ -1158,6 +1190,11 @@ def estimate_sensitivity(
                     note=(
                         f"用 {biggest}° 档 {len(ratios)} 次试验估计，"
                         "分母是 RTDE 实际关节角变化。"
+                        + (
+                            "这个数是 °/°（画面二维转角 ÷ 关节角变化），不是 px/°。"
+                            if rotation_joint
+                            else ""
+                        )
                     ),
                 )
                 continue
@@ -1183,6 +1220,7 @@ def estimate_sensitivity(
                     "**退化估计**：RTDE 实际角拿不到（或全为 0），"
                     f"改用指令角做分母（{len(ratios)} 次）。"
                     "这个数字里混着伺服没跟上的部分，只作参考。"
+                    + ("单位是 °/°。" if rotation_joint else "")
                 ),
             )
     return results
@@ -1246,6 +1284,24 @@ def recommend_steps(
         rows = sorted(
             [s for s in summaries if s.joint == joint], key=lambda s: s.amplitude_deg
         )
+        if not rows:
+            # 这个关节这次压根没跑预实验。不能说"没有一档通过判据"——
+            # 那是"测了但都不合格"，跟"没测"是两回事，混在一起会让人以为
+            # 数据不好，而其实只是配置里没勾这个关节。
+            recommendations.append(
+                StepRecommendation(
+                    joint=joint,
+                    recommended_deg=None,
+                    reason=(
+                        "这个关节这次没有跑预实验（不在 pretest.joints 里），"
+                        "没有候选幅度可推荐。要它也有推荐值，请在参数里把它加进"
+                        "预实验关节、重新采一遍三档幅度。"
+                    ),
+                    detail_lines=[],
+                    needs_manual_input=True,
+                )
+            )
+            continue
         detail = []
         chosen: float | None = None
         for row in rows:
@@ -1603,6 +1659,16 @@ def analyze_pretest(
                 "请复核现场是否有人在碰设备。"
             )
 
+    if not metrics_list:
+        # 到了这里说明一段统计试验都没有（例如只采了静态基线就按了分析，
+        # 或者预实验在第一段之前就被中止）。这时报告里除了静态噪声什么都没有，
+        # 必须把"为什么没有推荐步长"说成"没测"，而不是让人对着空表猜。
+        warnings.append(
+            "这次没有任何统计试验（预实验没跑，或在第一段之前就中止了）："
+            "静态噪声算得出来，但没有可用的候选幅度，也就没有推荐步长。"
+            "已采到的数据都还在，补跑预实验之后不必重采静态基线。"
+        )
+
     return PretestReport(
         static_noise=static_noise,
         directions=directions,
@@ -1615,21 +1681,51 @@ def analyze_pretest(
     )
 
 
+#: 空结果也要写出 CSV，而 write_csv 在"一行都没有"时是没法自己决定表头的。
+#: 下面这几个占位实例**只用来取列名**，它们的数值一个都不会进报告。
+#: 之所以用真实例而不是手写一份列名清单：手写的会慢慢和数据类脱节，
+#: 而这里只要给 TrialMetrics 加了必填字段，构造这两个占位实例时会立刻报错。
+_TRIALS_PROTOTYPE = TrialMetrics(
+    event_id="",
+    joint="",
+    stage="",
+    amplitude_deg=0.0,
+    direction=1,
+    repeat=1,
+    segment_id="",
+    commanded_delta_deg=0.0,
+)
+_AMPLITUDES_PROTOTYPE = AmplitudeSummary(joint="", amplitude_deg=0.0)
+_SENSITIVITY_PROTOTYPE = Sensitivity(
+    joint="", direction=1, px_per_deg=None, source="", samples=0, note=""
+)
+
+
 def write_report(report: PretestReport, out_dir: Path) -> dict[str, Path]:
-    """把报告写成 CSV + JSON + 人可读文本。返回写出的文件。"""
+    """把报告写成 CSV + JSON + 人可读文本。返回写出的文件。
+
+    空结果（例如只采了静态基线、预实验被中止）也要能写出**带表头**的 CSV：
+    分析结果目录缺文件会让人以为是丢了东西，而"这次没有统计试验"本身
+    就是要如实写下来的事实之一。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     from .recorder import write_csv, write_json, write_text
 
     paths: dict[str, Path] = {}
     paths["trials"] = write_csv(
-        out_dir / "trials.csv", [t.to_row() for t in report.trials]
+        out_dir / "trials.csv",
+        [t.to_row() for t in report.trials],
+        columns=list(_TRIALS_PROTOTYPE.to_row()),
     )
     paths["amplitudes"] = write_csv(
-        out_dir / "amplitudes.csv", [s.to_row() for s in report.summaries]
+        out_dir / "amplitudes.csv",
+        [s.to_row() for s in report.summaries],
+        columns=list(_AMPLITUDES_PROTOTYPE.to_row()),
     )
     paths["sensitivity"] = write_csv(
         out_dir / "sensitivity.csv",
         [report.sensitivities[key].to_dict() for key in sorted(report.sensitivities)],
+        columns=list(_SENSITIVITY_PROTOTYPE.to_dict()),
     )
     paths["directions"] = write_csv(
         out_dir / "directions.csv",
