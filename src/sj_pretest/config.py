@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 import shutil
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -145,10 +145,13 @@ class RobotConfig:
     approach_speed_deg_s: float = 1.0
     approach_accel_deg_s2: float = 2.0
 
-    #: 微动步进的速度/加速度。★ 旧项目实验速度是 1 mm/s（约 0.057°/s @1 m），
-    #: 这里取 0.05 °/s 作为同量级的保守默认。
-    trial_speed_deg_s: float = 0.05
-    trial_accel_deg_s2: float = 0.1
+    #: 微动步进的速度/加速度。★ 来历见 README「默认值的来历」：
+    #: 旧项目真机用过的**最快**档是 0.05 m/s 直线速度（约 2.9°/s @1 m 臂展），
+    #: 最保守档是 0.02 m/s（约 1.15°/s）。这里取 0.5 °/s，比最保守档还慢一倍。
+    #: 不用更慢的原因：0.05°/s 会让 0.2° 的一步走 4 秒，整套 72 次要录二十多分钟，
+    #: 存储代价不可接受，而微动步长的科学意义在**幅值**而不是"走得慢"。
+    trial_speed_deg_s: float = 0.5
+    trial_accel_deg_s2: float = 1.0
 
     #: 每个动作后等待关节真正停稳的判据。
     settle_tolerance_deg: float = 0.002
@@ -257,12 +260,19 @@ class CameraConfig:
 
     #: 采集时长（秒）。静态噪声测量默认 15 s（需求允许 10～20 s）。
     static_duration_s: float = 15.0
-    #: 每次运动后继续录制的时间，用来观察"RTDE 稳了但画面还在动"。
-    post_motion_s: float = 1.0
-    #: 运动前先录一段静止，作为这次动作自己的参考帧。
-    pre_motion_s: float = 0.5
-    #: 保持不动的时间（每个动作点到点之间）。
-    hold_s: float = 1.0
+    #: 运动后继续录制的时间，用来观察"RTDE 稳了但画面还在动"。
+    #: 需求六的动态残差层就靠这一段，所以不能太短；0.3 s ≈ 40 帧。
+    post_motion_s: float = 0.3
+    #: 运动前先录一段静止，作为这次动作自己的参考帧。0.3 s ≈ 40 帧。
+    pre_motion_s: float = 0.3
+    #: 到达目标并停稳之后，继续保持录制的时间。
+    #: 这是整套预实验里**最有信息量**的一段（稳定值 + 残余振动），
+    #: 所以给到 1.5 s ≈ 200 帧；嫌数据大可以在界面上调小。
+    hold_s: float = 1.5
+    #: 裁剪区域 (x, y, w, h)，None = 不裁剪。
+    #: ★ 现场建议填一个包住棋盘格的区域：分辨率是磁盘占用的第一主导项，
+    #: 1936×1096 全画幅在 132 fps 下约 280 MB/s，裁到 800×600 只剩约 48 MB/s。
+    roi: list[int] | None = None
 
     #: 是否保存原始帧（流式写 frames.raw）。
     save_raw: bool = True
@@ -317,7 +327,25 @@ class CameraConfig:
             _non_negative(
                 _as_float(getattr(self, name), f"{where}.{name}"), f"{where}.{name}"
             )
-        _as_bool(self.save_raw, f"{where}.save_raw")
+        if self.roi is not None:
+            if not isinstance(self.roi, (list, tuple)) or len(self.roi) != 4:
+                raise ConfigError(
+                    f"{where}.roi 必须是 [x, y, w, h] 四个整数，或 null 表示不裁剪，"
+                    f"收到 {self.roi!r}"
+                )
+            for position, value in enumerate(self.roi):
+                number = _as_int(value, f"{where}.roi[{position}]")
+                if number < 0:
+                    raise ConfigError(f"{where}.roi[{position}] 不能为负，收到 {number}")
+            if int(self.roi[2]) <= 0 or int(self.roi[3]) <= 0:
+                raise ConfigError(f"{where}.roi 的宽和高必须为正，收到 {self.roi!r}")
+        if not _as_bool(self.save_raw, f"{where}.save_raw"):
+            # 需求六要求原始帧必须完整保存（RAW 或经过验证的无损视频）。
+            # 关掉它就没有可供离线识别和复核的数据了，所以这里直接拒绝。
+            raise ConfigError(
+                f"{where}.save_raw 必须是 true：本工具要求完整保存原始帧，"
+                "否则实验结束后无法离线复核角点。"
+            )
         _as_bool(self.save_sample_images, f"{where}.save_sample_images")
         margin = _as_int(self.min_margin_px, f"{where}.min_margin_px")
         if margin < 0:
@@ -463,6 +491,23 @@ class ThresholdConfig:
     joint_limit_margin_deg: float = 5.0
     #: 允许的最大深度/面内运动比（超出说明主要不是面内运动）。
     max_depth_ratio: float = 0.5
+    #: 符号正确率下限（1.0 = 每一次都必须同号）。
+    min_sign_consistency: float = 1.0
+    #: 重复之间的差，除了相对上限以外还给一个"绝对噪声倍数"上限：
+    #: 小步长时相对上限会松得离谱，绝对倍数才能拦住"两次差出好几倍噪声"。
+    repeat_noise_multiple: float = 3.0
+    #: RTDE 实际变化 ÷ 指令变化 的下限。
+    min_rtde_response_ratio: float = 0.5
+    #: 第三层判据：RTDE 停稳后画面残余运动超过静态噪声多少倍才算"还在振"。
+    residual_factor: float = 3.0
+    #: 正负两组位移的夹角与 180° 的最大允许偏差（度）。超出则方向不可信。
+    direction_tolerance_deg: float = 30.0
+    #: 快速几何检查（按钮二 B，0.05° 探针）：位移至少要达到静止段噪声的多少倍
+    #: 才算"画面上有可见运动"。这一档本来就是"0.05° 看不看得出来"的判据，
+    #: 所以门槛比正式分析的 5 倍低：3 倍。
+    quick_probe_min_snr: float = 3.0
+    #: 快速几何检查里"方向大致符合理论"的容差（度）。
+    quick_probe_direction_tol_deg: float = 45.0
 
     def validate(self) -> None:
         where = "thresholds"
@@ -498,6 +543,48 @@ class ThresholdConfig:
             _as_float(self.max_depth_ratio, f"{where}.max_depth_ratio"),
             f"{where}.max_depth_ratio",
         )
+        sign_floor = _as_float(
+            self.min_sign_consistency, f"{where}.min_sign_consistency"
+        )
+        if not 0.0 <= sign_floor <= 1.0:
+            raise ConfigError(
+                f"{where}.min_sign_consistency 必须在 0～1，收到 {sign_floor}"
+            )
+        _positive(
+            _as_float(self.repeat_noise_multiple, f"{where}.repeat_noise_multiple"),
+            f"{where}.repeat_noise_multiple",
+        )
+        response = _as_float(
+            self.min_rtde_response_ratio, f"{where}.min_rtde_response_ratio"
+        )
+        if not 0.0 < response <= 1.5:
+            raise ConfigError(
+                f"{where}.min_rtde_response_ratio 必须在 0～1.5，收到 {response}"
+            )
+        _positive(
+            _as_float(self.residual_factor, f"{where}.residual_factor"),
+            f"{where}.residual_factor",
+        )
+        tolerance = _as_float(
+            self.direction_tolerance_deg, f"{where}.direction_tolerance_deg"
+        )
+        if not 0.0 <= tolerance < 90.0:
+            raise ConfigError(
+                f"{where}.direction_tolerance_deg 必须在 0～90，收到 {tolerance}"
+                "（90 表示完全不检查正负是否反向）。"
+            )
+        _positive(
+            _as_float(self.quick_probe_min_snr, f"{where}.quick_probe_min_snr"),
+            f"{where}.quick_probe_min_snr",
+        )
+        probe_tol = _as_float(
+            self.quick_probe_direction_tol_deg,
+            f"{where}.quick_probe_direction_tol_deg",
+        )
+        if not 0.0 <= probe_tol <= 180.0:
+            raise ConfigError(
+                f"{where}.quick_probe_direction_tol_deg 必须在 0～180，收到 {probe_tol}"
+            )
 
 
 @dataclass
@@ -574,6 +661,142 @@ class PathConfig:
 
 
 @dataclass
+class DryRunConfig:
+    """干运行（dry_run）用的合成世界参数。只在 mode="dry_run" 时生效。
+
+    合成世界**不是**真实机械臂的模型，它的唯一用途是：让整套流程（采集 → 运动编排 →
+    离线角点 → 三层分析 → 步长推荐）在不接真机的前提下真的被跑一遍。
+    所以它的输出必须始终标记为 synthetic，绝不能当成实验结果。
+    """
+
+    #: 合成图像尺寸（像素）。默认小一点，让自测产生的 RAW 不至于吃掉几十 GB。
+    width: int = 480
+    height: int = 360
+    #: 合成帧率。默认与被复用代码期望的 132.23 fps 一致，用来验证时间轴语义。
+    fps: float = 132.23
+    #: True = 按真实时间出图（能看预览、能感时间）；False = 虚拟时钟，跑得飞快。
+    realtime: bool = False
+    #: 把静态/保持/运动后的时长压短，让整套自测几分钟内跑完。
+    #: ★ 只有 dry_run 会看这个开关，replay/hardware 永远用 camera 里的真实时长。
+    shorten_durations: bool = True
+    #: 缩短后的时长（秒）。
+    static_duration_s: float = 3.0
+    pre_motion_s: float = 0.2
+    hold_s: float = 0.4
+    post_motion_s: float = 0.2
+    #: 每 N 帧故意让角点检测失败一次（验证"棋盘格丢失就暂停"）。0 = 不注入。
+    corner_loss_every: int = 0
+    #: 每 N 帧故意丢一帧（验证丢帧会被记录）。0 = 不注入。
+    drop_every: int = 0
+    #: 合成世界的噪声与灵敏度参数（只影响自测，不影响任何真实结论）。
+    #: 噪声量级按"真实 3 mm 棋盘格在 675 mm 处成像约 10 px/格"的情况取，
+    #: 所以 0.5 px 的质心抖动是现场会遇到的量级，不是为了让自测好看而挑的数。
+    centroid_noise_px: float = 0.5
+    rotation_noise_deg: float = 0.02
+    #: 各关节的合成灵敏度（像素/度）。数值刻意大小不一：
+    #: 这样"0.01° 对某些关节够用、对另一些不够"的判据在自测里能被真正走到。
+    centroid_px_per_deg: dict[str, float] = field(
+        default_factory=lambda: {
+            "J1": 40.0,
+            "J2": 60.0,
+            "J3": 90.0,
+            "J4": 25.0,
+            "J5": 12.0,
+            "J6": 0.0,
+        }
+    )
+    #: 各关节合成的图像内运动方向（度，0 = 图像 +x 方向）。
+    #: 这几个数**不是随便填的**：它们等于
+    #: ``vision.expected_image_direction_deg`` 在默认名义姿态 + 默认摆放提示下
+    #: 算出来的预测方向。这样"方向是否大致符合理论"这条判据在干运行里应当是
+    #: 通过的；要验证它**能报错**，改其中一个方向（tests 里有专门用例）即可。
+    image_direction_deg: dict[str, float] = field(
+        default_factory=lambda: {
+            "J1": 0.0,
+            "J2": -114.5,
+            "J3": 91.9,
+            "J4": 95.2,
+            "J5": -135.7,
+            "J6": 0.0,
+        }
+    )
+    #: J6 的合成旋转灵敏度（图像转角/关节角）。
+    rotation_deg_per_deg: float = 1.0
+    #: 运动后的合成"结构振荡"：幅值（像素）、频率（Hz）、衰减时间常数（秒）。
+    vibration_amplitude_px: float = 0.4
+    vibration_hz: float = 6.5
+    vibration_tau_s: float = 0.25
+    #: 关节对指令的一阶跟随时间常数（秒），用来合成"RTDE 也在动"的过程。
+    joint_response_tau_s: float = 0.12
+    #: 合成世界的随机种子，保证自测可重复。
+    seed: int = 20260923
+
+    @property
+    def duration_overrides(self) -> dict[str, float]:
+        """dry_run 要覆盖的时长。关闭 shorten 时返回空字典。"""
+        if not self.shorten_durations:
+            return {}
+        return {
+            "static": float(self.static_duration_s),
+            "pre_motion": float(self.pre_motion_s),
+            "hold": float(self.hold_s),
+            "post_motion": float(self.post_motion_s),
+        }
+
+    def validate(self) -> None:
+        where = "dry_run"
+        width = _as_int(self.width, f"{where}.width")
+        height = _as_int(self.height, f"{where}.height")
+        if not 64 <= width <= 4096 or not 64 <= height <= 4096:
+            raise ConfigError(
+                f"{where} 的合成图像尺寸必须在 64～4096，收到 {width}×{height}"
+            )
+        _positive(_as_float(self.fps, f"{where}.fps"), f"{where}.fps")
+        _as_bool(self.realtime, f"{where}.realtime")
+        _as_bool(self.shorten_durations, f"{where}.shorten_durations")
+        for name in ("static_duration_s", "pre_motion_s", "hold_s", "post_motion_s"):
+            value = _non_negative(
+                _as_float(getattr(self, name), f"{where}.{name}"), f"{where}.{name}"
+            )
+            if value > 120.0:
+                raise ConfigError(f"{where}.{name} = {value} s 太长（上限 120 s）。")
+        for name in ("corner_loss_every", "drop_every"):
+            value = _as_int(getattr(self, name), f"{where}.{name}")
+            if value < 0:
+                raise ConfigError(f"{where}.{name} 不能为负，收到 {value}")
+        _positive(
+            _as_float(self.centroid_noise_px, f"{where}.centroid_noise_px"),
+            f"{where}.centroid_noise_px",
+        )
+        _non_negative(
+            _as_float(self.rotation_noise_deg, f"{where}.rotation_noise_deg"),
+            f"{where}.rotation_noise_deg",
+        )
+        for dict_name, expected in (
+            ("centroid_px_per_deg", JOINT_NAMES),
+            ("image_direction_deg", JOINT_NAMES),
+        ):
+            values = getattr(self, dict_name)
+            if not isinstance(values, Mapping):
+                raise ConfigError(f"{where}.{dict_name} 必须是 JSON 对象。")
+            for joint in expected:
+                if joint not in values:
+                    raise ConfigError(
+                        f"{where}.{dict_name} 缺少 {joint}，六个关节都要给。"
+                    )
+                _as_float(values[joint], f"{where}.{dict_name}[{joint}]")
+        _positive(
+            _as_float(self.rotation_deg_per_deg, f"{where}.rotation_deg_per_deg"),
+            f"{where}.rotation_deg_per_deg",
+        )
+        for name in ("vibration_amplitude_px", "vibration_tau_s", "joint_response_tau_s"):
+            _positive(_as_float(getattr(self, name), f"{where}.{name}"), f"{where}.{name}")
+        _positive(_as_float(self.vibration_hz, f"{where}.vibration_hz"),
+                  f"{where}.vibration_hz")
+        _as_int(self.seed, f"{where}.seed")
+
+
+@dataclass
 class AppConfig:
     """整套配置。界面改的就是它，存 JSON 的也是它。"""
 
@@ -589,6 +812,7 @@ class AppConfig:
     thresholds: ThresholdConfig = field(default_factory=ThresholdConfig)
     formal: FormalConfig = field(default_factory=FormalConfig)
     paths: PathConfig = field(default_factory=PathConfig)
+    dry_run: DryRunConfig = field(default_factory=DryRunConfig)
 
     # -- 校验 ---------------------------------------------------------------
 
@@ -608,6 +832,7 @@ class AppConfig:
         self.thresholds.validate()
         self.formal.validate()
         self.paths.validate()
+        self.dry_run.validate()
 
         self._validate_joint_coverage()
         self._validate_amplitudes_within_limits()
@@ -683,6 +908,7 @@ class AppConfig:
             thresholds=_build(ThresholdConfig, data.get("thresholds"), "thresholds"),
             formal=_build(FormalConfig, data.get("formal"), "formal"),
             paths=_build(PathConfig, data.get("paths"), "paths"),
+            dry_run=_build(DryRunConfig, data.get("dry_run"), "dry_run"),
         )
         config.validate()
         return config
@@ -699,6 +925,44 @@ class AppConfig:
         return cls.from_dict(raw)
 
     # -- 派生信息 -----------------------------------------------------------
+
+    def effective_durations(self) -> dict[str, float]:
+        """当前模式下**真正生效**的四个时长。
+
+        dry_run 且开了 ``shorten_durations`` 时用合成世界的短时长，
+        其余情况一律用 ``camera`` 里的现场时长——这条规则很关键：
+        自测跑的时长和真机跑的时长不是一回事，不能拿自测的时长去推断真机要多久。
+        """
+        durations = {
+            "static": float(self.camera.static_duration_s),
+            "pre_motion": float(self.camera.pre_motion_s),
+            "hold": float(self.camera.hold_s),
+            "post_motion": float(self.camera.post_motion_s),
+        }
+        if self.mode == "dry_run":
+            durations.update(self.dry_run.duration_overrides)
+        return durations
+
+    def effective_camera_size(self) -> tuple[int, int]:
+        """当前模式下每帧的宽高（像素）。用于磁盘估算。"""
+        if self.mode == "dry_run":
+            return int(self.dry_run.width), int(self.dry_run.height)
+        roi = self.camera.roi
+        if roi:
+            return int(roi[2]), int(roi[3])
+        # 没有 ROI 时按传感器满幅估（MV-CS028-10UM 是 1936×1096）。
+        return 1936, 1096
+
+    def effective_fps(self) -> float:
+        if self.mode == "dry_run":
+            return float(self.dry_run.fps)
+        return float(self.camera.expected_fps)
+
+    def effective_speed(self, *, formal: bool = False) -> tuple[float, float]:
+        """当前模式下生效的角速度/角加速度（度/秒、度/秒²）。"""
+        if formal:
+            return float(self.formal.speed_deg_s), float(self.formal.accel_deg_s2)
+        return float(self.robot.trial_speed_deg_s), float(self.robot.trial_accel_deg_s2)
 
     def resolve_output_root(self) -> Path:
         """输出根目录：相对路径按"当前工作目录"解析，绝对路径原样使用。"""
@@ -747,6 +1011,111 @@ def _build(cls: type, data: Any, where: str) -> Any:
         if item.name in data:
             kwargs[item.name] = data[item.name]
     return cls(**kwargs)
+
+
+def trapezoid_seconds(distance_deg: float, speed_deg_s: float, accel_deg_s2: float) -> float:
+    """梯形速度曲线走完一段角位移需要多久（秒）。
+
+    加速段和减速段各用 ``v/a`` 秒；如果这段距离短到还没加到最高速就要开始减速，
+    就用三角形曲线，时间 = ``2*sqrt(d/a)``。这是一个理想化模型——真机还有滤波、
+    关节耦合和控制器自己的规划，实际会比这个数字长，所以估算时只用它做保守下界，
+    真正的时长以 RTDE 记录的到位时间为准。
+    """
+    distance = abs(float(distance_deg))
+    if distance <= 0:
+        return 0.0
+    speed = float(speed_deg_s)
+    accel = float(accel_deg_s2)
+    if speed <= 0 or accel <= 0:
+        raise ConfigError("速度/加速度必须为正。")
+    ramp_distance = speed * speed / accel
+    if distance <= ramp_distance:
+        return 2.0 * math.sqrt(distance / accel)
+    return distance / speed + speed / accel
+
+
+def estimate_capture_seconds(config: AppConfig, plans: Iterable[Any]) -> float:
+    """估算这些计划一共要录制多少秒（用来算磁盘占用）。
+
+    规则：一个"去程 + 回程"算作一次试验，录一段连续的：运动前静止 → 去程 →
+    保持 → 回程 → 运动后记录。纯等待步（组间等待）不录制。
+    """
+    durations = config.effective_durations()
+    speed, accel = config.effective_speed()
+    total = 0.0
+    for plan in plans:
+        steps = list(getattr(plan, "steps", plan))
+        index = 0
+        while index < len(steps):
+            step = steps[index]
+            if not step.is_motion:
+                # 纯等待：不做视觉记录。
+                index += 1
+                continue
+            if step.event.role != "move":
+                # 单独出现的回程（理论上不会，防御一下）。
+                delta = _step_delta(step)
+                total += trapezoid_seconds(delta, speed, accel) + step.hold_s
+                index += 1
+                continue
+            total += durations["pre_motion"]
+            total += trapezoid_seconds(_step_delta(step), speed, accel)
+            total += float(step.hold_s)
+            next_step = steps[index + 1] if index + 1 < len(steps) else None
+            if (
+                next_step is not None
+                and next_step.event.role == "return"
+                and next_step.is_motion
+            ):
+                total += trapezoid_seconds(_step_delta(next_step), speed, accel)
+                total += float(next_step.hold_s)
+                index += 2
+            else:
+                index += 1
+            total += durations["post_motion"]
+        if not any(step.is_motion for step in steps):
+            # 纯静态计划：只录静态那一段。
+            total += sum(float(step.hold_s) for step in steps)
+    return total
+
+
+def _step_delta(step: Any) -> float:
+    event = step.event
+    if event.expected_delta_deg is not None:
+        return abs(float(event.expected_delta_deg))
+    if event.amplitude_deg:
+        return abs(float(event.amplitude_deg))
+    target = step.target_joint_deg
+    if target is None:
+        return 0.0
+    return 0.0
+
+
+def estimate_disk_gb(config: AppConfig, capture_seconds: float) -> float:
+    """Mono8 RAW 会占多少 GB。**不含**离线角点结果和样本图（那些很小）。"""
+    width, height = config.effective_camera_size()
+    fps = config.effective_fps()
+    frames = float(capture_seconds) * fps
+    return frames * width * height / (1024.0**3)
+
+
+def disk_estimate_lines(config: AppConfig, plans: Iterable[Any]) -> list[str]:
+    """给界面/日志用的中文磁盘估算说明。"""
+    seconds = estimate_capture_seconds(config, plans)
+    size_gb = estimate_disk_gb(config, seconds)
+    width, height = config.effective_camera_size()
+    fps = config.effective_fps()
+    lines = [
+        f"预计录制总时长：约 {seconds / 60.0:.1f} 分钟（{seconds:.0f} 秒）",
+        f"预计 RAW 占用：约 {size_gb:.2f} GB"
+        f"（{width}×{height} Mono8 @ {fps:.2f} fps）",
+    ]
+    if config.mode != "dry_run" and config.camera.roi is None:
+        lines.append(
+            "★ 当前没有设置 ROI 裁剪：满幅 1936×1096 在 132 fps 下约 280 MB/s，"
+            "是磁盘占用的第一主导项。现场建议把 camera.roi 填成包住棋盘格的一块。"
+        )
+    return lines
 
 
 def default_config() -> AppConfig:
