@@ -1,0 +1,23 @@
+# 换行符策略：版本库里一律存 LF，检出一律给 LF（Windows 上 Python/JSON/MD 都能正常读）。
+# 目的：刚解压 / 刚 clone 出来的仓库，git status 必须是干净的，不能满屏"只有 CRLF 变化"。
+* text=auto
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.csv   text eol=lf
+*.ini   text eol=lf
+*.cfg   text eol=lf
+*.toml  text eol=lf
+
+# BAT 必须保持 CRLF，否则 cmd.exe 解析会出问题
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制文件不做任何换行转换
+*.png   binary
+*.jpg   binary
+*.raw   binary
+*.zip   binary
+*.pyc   binary

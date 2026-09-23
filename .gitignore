@@ -1,0 +1,40 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 实验原始数据：体积大，绝不进版本库
+outputs/
+runs/
+*.raw
+*.raw.tmp
+*.mp4
+*.avi
+
+# 交付产物
+delivery_*/
+*.zip
+
+# 临时文件
+*.tmp
+*.log
+~$*
+
+# 本机私有配置（相机序列号等现场参数）
+configs/local_*.json
+configs/*.local.json
